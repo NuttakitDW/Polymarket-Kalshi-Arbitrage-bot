@@ -10,7 +10,7 @@ test-arb:
 
 # Run in dry-run mode (no actual trades)
 dryrun:
-	DRYRUN=1 RUST_LOG=info cargo run
+	DRY_RUN=1 RUST_LOG=info cargo run
 
 # Open database in DB Browser for SQLite (macOS)
 db:
