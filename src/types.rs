@@ -62,6 +62,10 @@ pub struct MarketPair {
     pub line_value: Option<f64>,
     /// Team suffix for team-specific markets
     pub team_suffix: Option<Arc<str>>,
+    /// Category/series from Polymarket events (e.g., "Fed Emergency Rate Cut", "nuclear test")
+    pub category: Option<Arc<str>>,
+    /// Event title from Polymarket for additional context
+    pub event_title: Option<Arc<str>>,
 }
 
 /// Price representation in cents (1-99 for $0.01-$0.99), 0 indicates no price available
@@ -71,7 +75,8 @@ pub type PriceCents = u16;
 pub type SizeCents = u16;
 
 /// Maximum number of concurrently tracked markets
-pub const MAX_MARKETS: usize = 1024;
+/// Increased to handle pagination (can fetch up to 20K markets from Gamma API)
+pub const MAX_MARKETS: usize = 8192;
 
 /// Sentinel value indicating no price is currently available
 pub const NO_PRICE: PriceCents = 0;
@@ -1190,22 +1195,35 @@ mod tests {
     }
 }
 
-// === Kalshi API Types ===
-
 // === Polymarket/Gamma API Types ===
 
-#[derive(Debug, Deserialize)]
-pub struct GammaMarket {
+/// Tag/category information from Polymarket events
+#[derive(Debug, Clone, Deserialize)]
+pub struct GammaTag {
+    /// Tag label (e.g., "Tech", "Politics", "Business")
+    pub label: Option<String>,
+}
+
+/// Market object nested within an event (from /events endpoint)
+#[derive(Debug, Clone, Deserialize)]
+pub struct GammaEventMarket {
     pub slug: Option<String>,
     pub question: Option<String>,
     #[serde(rename = "clobTokenIds")]
     pub clob_token_ids: Option<String>,
     pub outcomes: Option<String>,
-    #[serde(rename = "outcomePrices")]
-    #[allow(dead_code)]
-    pub outcome_prices: Option<String>,
     pub active: Option<bool>,
     pub closed: Option<bool>,
+}
+
+/// Top-level event from /events endpoint (contains tags + markets)
+#[derive(Debug, Clone, Deserialize)]
+pub struct GammaEventResponse {
+    pub title: Option<String>,
+    /// Tags array with real categories like "Tech", "Politics", "Business"
+    pub tags: Option<Vec<GammaTag>>,
+    /// Markets nested under this event
+    pub markets: Option<Vec<GammaEventMarket>>,
 }
 
 // === Discovery Result ===

@@ -9,6 +9,7 @@ use anyhow::Result;
 use futures_util::{stream, StreamExt};
 use governor::{Quota, RateLimiter, state::NotKeyed, clock::DefaultClock, middleware::NoOpMiddleware};
 use serde::{Serialize, Deserialize};
+use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -541,13 +542,19 @@ impl DiscoveryClient {
 
         info!("📊 Fetched {} Polymarket markets", markets.len());
 
+        // Track tag statistics (each market can have multiple tags)
+        let mut tag_stats: HashMap<String, usize> = HashMap::new();
+        let mut markets_with_tags = 0;
+        let mut markets_without_tags = 0;
+
         // Debug: show sample of markets
         if !markets.is_empty() {
             let sample = &markets[0];
-            info!("   Sample market: question='{}', tokens={}, outcomes={}",
+            info!("   Sample market: question='{}', tokens={}, outcomes={}, tags={:?}",
                   sample.question.chars().take(50).collect::<String>(),
                   sample.token_ids.len(),
-                  sample.outcomes.len());
+                  sample.outcomes.len(),
+                  sample.tags);
         }
 
         // Filter for multi-outcome markets (2+ outcomes)
@@ -570,6 +577,18 @@ impl DiscoveryClient {
         for market in multi_outcome_markets {
             let num_outcomes = market.token_ids.len();
 
+            // Track tags for this market
+            if market.tags.is_empty() {
+                markets_without_tags += 1;
+                *tag_stats.entry("(no tags)".to_string()).or_insert(0) += 1;
+            } else {
+                markets_with_tags += 1;
+                // Count each tag separately
+                for tag in &market.tags {
+                    *tag_stats.entry(tag.clone()).or_insert(0) += 1;
+                }
+            }
+
             // Create pairs for all combinations of competing outcomes
             for i in 0..num_outcomes {
                 for j in (i + 1)..num_outcomes {
@@ -582,6 +601,24 @@ impl DiscoveryClient {
         }
 
         info!("✅ Found {} competing outcome pairs across all markets", result.pairs.len());
+
+        // Log tag statistics
+        info!("🏷️  Tag distribution ({} with tags, {} without):",
+              markets_with_tags, markets_without_tags);
+
+        // Sort tags by count (descending)
+        let mut tag_vec: Vec<_> = tag_stats.into_iter().collect();
+        tag_vec.sort_by(|a, b| b.1.cmp(&a.1));
+
+        // Log top tags (limit to top 20 for readability)
+        for (i, (tag, count)) in tag_vec.iter().take(20).enumerate() {
+            info!("   {:2}. {} ({} markets)", i + 1, tag, count);
+        }
+
+        if tag_vec.len() > 20 {
+            info!("   ... and {} more tags", tag_vec.len() - 20);
+        }
+
         result
     }
 
@@ -590,57 +627,120 @@ impl DiscoveryClient {
         self.discover_polymarket_only(leagues).await
     }
 
-    /// Fetch all active Polymarket markets from Gamma API
+    /// Fetch all active Polymarket markets from Gamma API /events endpoint with pagination
+    /// Uses /events instead of /markets to get proper category tags
     async fn fetch_polymarket_markets(&self) -> Result<Vec<PolymarketMarket>> {
-        // Request active, non-closed markets with limit
-        let url = format!("{}/markets?active=true&closed=false&limit=1000", GAMMA_API_BASE);
+        const PAGE_SIZE: usize = 100; // Events endpoint uses smaller pages
+        const MAX_PAGES: usize = 50; // Safety limit: 50 * 100 = 5,000 events max
 
-        let response = self.gamma.http.get(&url)
-            .send()
-            .await?;
+        let mut all_events: Vec<crate::types::GammaEventResponse> = Vec::new();
+        let mut offset = 0;
+        let mut page = 0;
 
-        if !response.status().is_success() {
-            anyhow::bail!("Gamma API returned status: {}", response.status());
+        // Paginate through all events
+        loop {
+            if page >= MAX_PAGES {
+                warn!("⚠️ Reached max pages limit ({}), stopping pagination", MAX_PAGES);
+                break;
+            }
+
+            let url = format!(
+                "{}/events?active=true&closed=false&limit={}&offset={}",
+                GAMMA_API_BASE, PAGE_SIZE, offset
+            );
+
+            info!("   Fetching events page {} (offset={})...", page + 1, offset);
+
+            let response = self.gamma.http.get(&url)
+                .send()
+                .await?;
+
+            if !response.status().is_success() {
+                anyhow::bail!("Gamma API returned status: {}", response.status());
+            }
+
+            let events: Vec<crate::types::GammaEventResponse> = response.json().await?;
+            let fetched_count = events.len();
+
+            info!("   Page {}: fetched {} events", page + 1, fetched_count);
+
+            all_events.extend(events);
+
+            // If we got fewer than PAGE_SIZE, we've reached the end
+            if fetched_count < PAGE_SIZE {
+                info!("   Reached end of events (got {} < {})", fetched_count, PAGE_SIZE);
+                break;
+            }
+
+            offset += PAGE_SIZE;
+            page += 1;
+
+            // Small delay between pages to be nice to the API
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         }
 
-        let markets: Vec<crate::types::GammaMarket> = response.json().await?;
+        info!("📊 Gamma API returned {} total events across {} pages", all_events.len(), page + 1);
 
-        info!("   Gamma API returned {} raw markets", markets.len());
-
-        // Convert to our internal format and filter for active markets
+        // Convert to our internal format - extract markets from each event with their tags
+        let mut poly_markets: Vec<PolymarketMarket> = Vec::new();
         let mut filtered_out_closed = 0;
         let mut filtered_out_no_tokens = 0;
+        let mut total_markets_found = 0;
 
-        let poly_markets: Vec<PolymarketMarket> = markets.into_iter()
-            .filter_map(|m| {
-                // Only include active, non-closed markets
-                if m.closed == Some(true) || m.active == Some(false) {
-                    filtered_out_closed += 1;
-                    return None;
-                }
-
-                // Parse token IDs
-                let token_ids: Vec<String> = m.clob_token_ids
-                    .as_ref()
-                    .and_then(|s| serde_json::from_str(s).ok())
-                    .unwrap_or_default();
-
-                if token_ids.is_empty() {
-                    filtered_out_no_tokens += 1;
-                    return None;
-                }
-
-                Some(PolymarketMarket {
-                    question: m.question.unwrap_or_default(),
-                    slug: m.slug.unwrap_or_default(),
-                    outcomes: m.outcomes.as_ref()
-                        .and_then(|s| serde_json::from_str(s).ok())
-                        .unwrap_or_default(),
-                    token_ids,
+        for event in all_events {
+            // Extract tags from this event (e.g., ["Tech", "AI", "Business"])
+            let event_tags: Vec<String> = event.tags
+                .as_ref()
+                .map(|tags| {
+                    tags.iter()
+                        .filter_map(|t| t.label.clone())
+                        .collect()
                 })
-            })
-            .collect();
+                .unwrap_or_default();
 
+            let event_title = event.title.clone();
+
+            // Process each market within this event
+            if let Some(markets) = event.markets {
+                for market in markets {
+                    total_markets_found += 1;
+
+                    // Only include active, non-closed markets
+                    if market.closed == Some(true) || market.active == Some(false) {
+                        filtered_out_closed += 1;
+                        continue;
+                    }
+
+                    // Parse token IDs
+                    let token_ids: Vec<String> = market.clob_token_ids
+                        .as_ref()
+                        .and_then(|s| serde_json::from_str(s).ok())
+                        .unwrap_or_default();
+
+                    if token_ids.is_empty() {
+                        filtered_out_no_tokens += 1;
+                        continue;
+                    }
+
+                    // Parse outcomes
+                    let outcomes: Vec<String> = market.outcomes
+                        .as_ref()
+                        .and_then(|s| serde_json::from_str(s).ok())
+                        .unwrap_or_default();
+
+                    poly_markets.push(PolymarketMarket {
+                        question: market.question.unwrap_or_default(),
+                        slug: market.slug.unwrap_or_default(),
+                        outcomes,
+                        token_ids,
+                        tags: event_tags.clone(),
+                        event_title: event_title.clone(),
+                    });
+                }
+            }
+        }
+
+        info!("   Total markets in events: {}", total_markets_found);
         info!("   Filtered: {} closed/inactive, {} without tokens, {} remaining",
               filtered_out_closed, filtered_out_no_tokens, poly_markets.len());
 
@@ -679,6 +779,13 @@ impl DiscoveryClient {
             outcome_b
         ).into();
 
+        // Join tags into a single string for category (e.g., "Tech, AI, Business")
+        let category: Option<Arc<str>> = if market.tags.is_empty() {
+            None
+        } else {
+            Some(market.tags.join(", ").into())
+        };
+
         Some(MarketPair {
             pair_id,
             league: "polymarket".into(),
@@ -692,6 +799,8 @@ impl DiscoveryClient {
             poly_no_token: token_b.clone().into(),              // Token B address (for WebSocket lookup)
             line_value: None,
             team_suffix: None,
+            category,
+            event_title: market.event_title.clone().map(|s| s.into()),
         })
     }
 }
@@ -703,6 +812,10 @@ struct PolymarketMarket {
     slug: String,
     outcomes: Vec<String>,
     token_ids: Vec<String>,
+    /// Tags from parent event (e.g., ["Tech", "AI", "Business"])
+    tags: Vec<String>,
+    /// Event title for additional context
+    event_title: Option<String>,
 }
 
 // === Helpers ===
