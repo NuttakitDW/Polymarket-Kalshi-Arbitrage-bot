@@ -34,7 +34,10 @@ impl std::fmt::Display for MarketType {
     }
 }
 
-/// A matched trading pair between Kalshi and Polymarket platforms
+/// A matched trading pair for Polymarket-only arbitrage (competing outcomes)
+///
+/// For Polymarket-only mode, this represents two competing outcomes from the same event.
+/// Example: "Chelsea YES" vs "Arsenal YES" in a match with multiple outcomes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MarketPair {
     /// Unique identifier for this market pair
@@ -45,15 +48,15 @@ pub struct MarketPair {
     pub market_type: MarketType,
     /// Human-readable market description
     pub description: Arc<str>,
-    /// Kalshi event ticker identifier
+    /// [REPURPOSED] Polymarket Token A condition_id (was kalshi_event_ticker)
     pub kalshi_event_ticker: Arc<str>,
-    /// Kalshi market ticker identifier
+    /// [REPURPOSED] Polymarket Token A condition_id (was kalshi_market_ticker)
     pub kalshi_market_ticker: Arc<str>,
-    /// Polymarket market slug
+    /// Polymarket Token B condition_id (or market slug)
     pub poly_slug: Arc<str>,
-    /// Polymarket YES outcome token address
+    /// Polymarket Token A address
     pub poly_yes_token: Arc<str>,
-    /// Polymarket NO outcome token address
+    /// Polymarket Token B address
     pub poly_no_token: Arc<str>,
     /// Line value for spread/total markets (if applicable)
     pub line_value: Option<f64>,
@@ -111,6 +114,7 @@ impl AtomicOrderbook {
 
     /// Store new state
     #[inline(always)]
+    #[allow(dead_code)]
     pub fn store(&self, yes_ask: PriceCents, no_ask: PriceCents, yes_size: SizeCents, no_size: SizeCents) {
         self.packed.store(pack_orderbook(yes_ask, no_ask, yes_size, no_size), Ordering::Release);
     }
@@ -131,6 +135,7 @@ impl AtomicOrderbook {
 
     /// Update NO side only
     #[inline(always)]
+    #[allow(dead_code)]
     pub fn update_no(&self, no_ask: PriceCents, no_size: SizeCents) {
         let mut current = self.packed.load(Ordering::Acquire);
         loop {
@@ -150,11 +155,15 @@ impl Default for AtomicOrderbook {
     }
 }
 
-/// Complete market state tracking both platforms' orderbooks for a single market
+/// Complete market state tracking orderbooks for competing outcomes in Polymarket-only arbitrage
+///
+/// For Polymarket-only mode, both orderbooks represent different Polymarket tokens:
+/// - `kalshi`: Orderbook for Polymarket Token A (e.g., "Chelsea YES")
+/// - `poly`: Orderbook for Polymarket Token B (e.g., "Arsenal YES")
 pub struct AtomicMarketState {
-    /// Kalshi platform orderbook state
+    /// [REPURPOSED] Polymarket Token A orderbook state (was Kalshi platform)
     pub kalshi: AtomicOrderbook,
-    /// Polymarket platform orderbook state
+    /// Polymarket Token B orderbook state
     pub poly: AtomicOrderbook,
     /// Market pair metadata (immutable after discovery phase)
     pub pair: Option<Arc<MarketPair>>,
@@ -172,37 +181,33 @@ impl AtomicMarketState {
         }
     }
 
+    /// Check for arbitrage opportunities.
+    ///
+    /// In Polymarket-only mode:
+    /// - k_yes = Token A YES price (stored in kalshi.yes_ask)
+    /// - p_yes = Token B YES price (stored in poly.yes_ask)
+    /// - k_no and p_no are NOT used (always 0)
+    ///
+    /// Returns bitmask: bit 2 = Poly-only arb (Token A YES + Token B YES < threshold)
     #[inline(always)]
     pub fn check_arbs(&self, threshold_cents: PriceCents) -> u8 {
-        use wide::{i16x8, CmpLt};
+        let (k_yes, _k_no, _, _) = self.kalshi.load();  // Token A YES
+        let (p_yes, _p_no, _, _) = self.poly.load();    // Token B YES
 
-        let (k_yes, k_no, _, _) = self.kalshi.load();
-        let (p_yes, p_no, _, _) = self.poly.load();
-
-        if k_yes == NO_PRICE || k_no == NO_PRICE || p_yes == NO_PRICE || p_no == NO_PRICE {
+        // For Polymarket-only mode: only check Token A YES + Token B YES
+        // (k_no and p_no are never set in this mode)
+        if k_yes == NO_PRICE || p_yes == NO_PRICE {
             return 0;
         }
 
-        let k_yes_fee = KALSHI_FEE_TABLE[k_yes as usize];
-        let k_no_fee = KALSHI_FEE_TABLE[k_no as usize];
+        // Poly-only arbitrage: Token A YES + Token B YES (competing outcomes, NO FEES!)
+        let poly_only_cost = k_yes + p_yes;
 
-        let costs = i16x8::new([
-            (p_yes + k_no + k_no_fee) as i16,
-            (k_yes + k_yes_fee + p_no) as i16,
-            (p_yes + p_no) as i16,
-            (k_yes + k_yes_fee + k_no + k_no_fee) as i16,
-            i16::MAX, i16::MAX, i16::MAX, i16::MAX,
-        ]);
-
-        let cmp = costs.cmp_lt(i16x8::splat(threshold_cents as i16));
-        let arr = cmp.to_array();
-
-        let mut mask = 0u8;
-        if arr[0] != 0 { mask |= 1; }
-        if arr[1] != 0 { mask |= 2; }
-        if arr[2] != 0 { mask |= 4; }
-        if arr[3] != 0 { mask |= 8; }
-        mask
+        if poly_only_cost < threshold_cents {
+            4  // bit 2 = Poly-only arb
+        } else {
+            0
+        }
     }
 }
 
@@ -223,6 +228,7 @@ static KALSHI_FEE_TABLE: [u16; 101] = {
 /// Calculate Kalshi trading fee in cents for a single contract at the given price.
 /// For typical prices (10-90 cents), fees are usually 1-2 cents per contract.
 #[inline(always)]
+#[allow(dead_code)]
 pub fn kalshi_fee_cents(price_cents: PriceCents) -> PriceCents {
     if price_cents > 100 {
         return 0;
@@ -271,14 +277,8 @@ pub fn parse_price(s: &str) -> PriceCents {
 /// Arbitrage opportunity type, determining the execution strategy
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArbType {
-    /// Cross-platform: Buy Polymarket YES + Buy Kalshi NO
-    PolyYesKalshiNo,
-    /// Cross-platform: Buy Kalshi YES + Buy Polymarket NO
-    KalshiYesPolyNo,
-    /// Same-platform: Buy Polymarket YES + Buy Polymarket NO
+    /// Same-platform: Buy Polymarket YES + Buy Polymarket NO (competing outcomes)
     PolyOnly,
-    /// Same-platform: Buy Kalshi YES + Buy Kalshi NO
-    KalshiOnly,
 }
 
 /// High-priority execution request for an arbitrage opportunity
@@ -309,13 +309,8 @@ impl FastExecutionRequest {
     #[inline(always)]
     pub fn estimated_fee_cents(&self) -> PriceCents {
         match self.arb_type {
-            // Cross-platform: fee on the Kalshi side only
-            ArbType::PolyYesKalshiNo => kalshi_fee_cents(self.no_price),
-            ArbType::KalshiYesPolyNo => kalshi_fee_cents(self.yes_price),
             // Poly-only: no fees
             ArbType::PolyOnly => 0,
-            // Kalshi-only: fees on both sides
-            ArbType::KalshiOnly => kalshi_fee_cents(self.yes_price) + kalshi_fee_cents(self.no_price),
         }
     }
 }
@@ -1197,49 +1192,9 @@ mod tests {
 
 // === Kalshi API Types ===
 
-#[derive(Debug, Deserialize)]
-pub struct KalshiEventsResponse {
-    pub events: Vec<KalshiEvent>,
-    #[serde(default)]
-    #[allow(dead_code)]
-    pub cursor: Option<String>,
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct KalshiEvent {
-    pub event_ticker: String,
-    pub title: String,
-    #[serde(default)]
-    #[allow(dead_code)]
-    pub sub_title: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct KalshiMarketsResponse {
-    pub markets: Vec<KalshiMarket>,
-}
-
-#[derive(Debug, Deserialize, Clone)]
-#[allow(dead_code)]
-pub struct KalshiMarket {
-    pub ticker: String,
-    pub title: String,
-    pub yes_ask: Option<i64>,
-    pub yes_bid: Option<i64>,
-    pub no_ask: Option<i64>,
-    pub no_bid: Option<i64>,
-    #[serde(default)]
-    pub yes_sub_title: Option<String>,
-    #[serde(default)]
-    pub floor_strike: Option<f64>,
-    pub volume: Option<i64>,
-    pub liquidity: Option<i64>,
-}
-
 // === Polymarket/Gamma API Types ===
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub struct GammaMarket {
     pub slug: Option<String>,
     pub question: Option<String>,
@@ -1247,6 +1202,7 @@ pub struct GammaMarket {
     pub clob_token_ids: Option<String>,
     pub outcomes: Option<String>,
     #[serde(rename = "outcomePrices")]
+    #[allow(dead_code)]
     pub outcome_prices: Option<String>,
     pub active: Option<bool>,
     pub closed: Option<bool>,
@@ -1257,9 +1213,6 @@ pub struct GammaMarket {
 #[derive(Debug, Default)]
 pub struct DiscoveryResult {
     pub pairs: Vec<MarketPair>,
-    pub kalshi_events_found: usize,
     pub poly_matches: usize,
-    #[allow(dead_code)]
-    pub poly_misses: usize,
     pub errors: Vec<String>,
 }

@@ -567,16 +567,6 @@ impl SharedAsyncClient {
         }
     }
 
-    /// Load neg_risk cache from JSON file (output of build_sports_cache.py)
-    pub fn load_cache(&self, path: &str) -> Result<usize> {
-        let data = std::fs::read_to_string(path)?;
-        let map: HashMap<String, bool> = serde_json::from_str(&data)?;
-        let count = map.len();
-        let mut cache = self.neg_risk_cache.write().unwrap();
-        *cache = map;
-        Ok(count)
-    }
-
     /// Execute FAK buy order - 
     pub async fn buy_fak(&self, token_id: &str, price: f64, size: f64) -> Result<PolyFillAsync> {
         debug_assert!(!token_id.is_empty(), "token_id must not be empty");
