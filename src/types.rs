@@ -4,7 +4,7 @@
 //! orderbook representation, and arbitrage opportunity detection.
 
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use rustc_hash::FxHashMap;
 
@@ -71,8 +71,8 @@ pub struct MarketPair {
 /// Price representation in cents (1-99 for $0.01-$0.99), 0 indicates no price available
 pub type PriceCents = u16;
 
-/// Size representation in cents (dollar amount × 100), maximum ~$655k per side
-pub type SizeCents = u16;
+/// Size representation in cents (dollar amount × 100), maximum ~$42.9M per side
+pub type SizeCents = u32;
 
 /// Maximum number of concurrently tracked markets
 /// Increased to handle pagination (can fetch up to 20K markets from Gamma API)
@@ -81,59 +81,92 @@ pub const MAX_MARKETS: usize = 8192;
 /// Sentinel value indicating no price is currently available
 pub const NO_PRICE: PriceCents = 0;
 
-/// Pack orderbook state into a single u64 for atomic operations.
-/// Bit layout: [yes_ask:16][no_ask:16][yes_size:16][no_size:16]
+/// Pack prices into a single u32 for atomic operations.
+/// Bit layout: [yes_ask:16][no_ask:16]
 #[inline(always)]
-pub fn pack_orderbook(yes_ask: PriceCents, no_ask: PriceCents, yes_size: SizeCents, no_size: SizeCents) -> u64 {
-    ((yes_ask as u64) << 48) | ((no_ask as u64) << 32) | ((yes_size as u64) << 16) | (no_size as u64)
+pub fn pack_prices(yes_ask: PriceCents, no_ask: PriceCents) -> u32 {
+    ((yes_ask as u32) << 16) | (no_ask as u32)
 }
 
-/// Unpack a u64 orderbook representation back into its component values
+/// Unpack a u32 prices representation back into its component values
 #[inline(always)]
-pub fn unpack_orderbook(packed: u64) -> (PriceCents, PriceCents, SizeCents, SizeCents) {
-    let yes_ask = ((packed >> 48) & 0xFFFF) as PriceCents;
-    let no_ask = ((packed >> 32) & 0xFFFF) as PriceCents;
-    let yes_size = ((packed >> 16) & 0xFFFF) as SizeCents;
-    let no_size = (packed & 0xFFFF) as SizeCents;
-    (yes_ask, no_ask, yes_size, no_size)
+pub fn unpack_prices(packed: u32) -> (PriceCents, PriceCents) {
+    let yes_ask = ((packed >> 16) & 0xFFFF) as PriceCents;
+    let no_ask = (packed & 0xFFFF) as PriceCents;
+    (yes_ask, no_ask)
+}
+
+/// Pack sizes into a single u64 for atomic operations.
+/// Bit layout: [yes_size:32][no_size:32]
+#[inline(always)]
+pub fn pack_sizes(yes_size: SizeCents, no_size: SizeCents) -> u64 {
+    ((yes_size as u64) << 32) | (no_size as u64)
+}
+
+/// Unpack a u64 sizes representation back into its component values
+#[inline(always)]
+pub fn unpack_sizes(packed: u64) -> (SizeCents, SizeCents) {
+    let yes_size = ((packed >> 32) & 0xFFFFFFFF) as SizeCents;
+    let no_size = (packed & 0xFFFFFFFF) as SizeCents;
+    (yes_size, no_size)
 }
 
 /// Lock-free orderbook state for a single trading platform.
 /// Uses atomic operations for thread-safe, zero-copy price updates.
+/// Split into two atomics to support u32 sizes (up to ~$42.9M per side).
 #[repr(align(64))]
 pub struct AtomicOrderbook {
-    /// Packed orderbook state: [yes_ask:16][no_ask:16][yes_size:16][no_size:16]
-    packed: AtomicU64,
+    /// Packed prices: [yes_ask:16][no_ask:16]
+    prices: AtomicU32,
+    /// Packed sizes: [yes_size:32][no_size:32]
+    sizes: AtomicU64,
 }
 
 impl AtomicOrderbook {
     pub const fn new() -> Self {
-        Self { packed: AtomicU64::new(0) }
+        Self {
+            prices: AtomicU32::new(0),
+            sizes: AtomicU64::new(0),
+        }
     }
 
     /// Load current state
     #[inline(always)]
     pub fn load(&self) -> (PriceCents, PriceCents, SizeCents, SizeCents) {
-        unpack_orderbook(self.packed.load(Ordering::Acquire))
+        let (yes_ask, no_ask) = unpack_prices(self.prices.load(Ordering::Acquire));
+        let (yes_size, no_size) = unpack_sizes(self.sizes.load(Ordering::Acquire));
+        (yes_ask, no_ask, yes_size, no_size)
     }
 
     /// Store new state
     #[inline(always)]
     #[allow(dead_code)]
     pub fn store(&self, yes_ask: PriceCents, no_ask: PriceCents, yes_size: SizeCents, no_size: SizeCents) {
-        self.packed.store(pack_orderbook(yes_ask, no_ask, yes_size, no_size), Ordering::Release);
+        self.prices.store(pack_prices(yes_ask, no_ask), Ordering::Release);
+        self.sizes.store(pack_sizes(yes_size, no_size), Ordering::Release);
     }
 
     /// Update YES side only
     #[inline(always)]
     pub fn update_yes(&self, yes_ask: PriceCents, yes_size: SizeCents) {
-        let mut current = self.packed.load(Ordering::Acquire);
+        // Update prices atomically
+        let mut current_prices = self.prices.load(Ordering::Acquire);
         loop {
-            let (_, no_ask, _, no_size) = unpack_orderbook(current);
-            let new = pack_orderbook(yes_ask, no_ask, yes_size, no_size);
-            match self.packed.compare_exchange_weak(current, new, Ordering::AcqRel, Ordering::Acquire) {
+            let (_, no_ask) = unpack_prices(current_prices);
+            let new_prices = pack_prices(yes_ask, no_ask);
+            match self.prices.compare_exchange_weak(current_prices, new_prices, Ordering::AcqRel, Ordering::Acquire) {
                 Ok(_) => break,
-                Err(c) => current = c,
+                Err(c) => current_prices = c,
+            }
+        }
+        // Update sizes atomically
+        let mut current_sizes = self.sizes.load(Ordering::Acquire);
+        loop {
+            let (_, no_size) = unpack_sizes(current_sizes);
+            let new_sizes = pack_sizes(yes_size, no_size);
+            match self.sizes.compare_exchange_weak(current_sizes, new_sizes, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => break,
+                Err(c) => current_sizes = c,
             }
         }
     }
@@ -142,13 +175,24 @@ impl AtomicOrderbook {
     #[inline(always)]
     #[allow(dead_code)]
     pub fn update_no(&self, no_ask: PriceCents, no_size: SizeCents) {
-        let mut current = self.packed.load(Ordering::Acquire);
+        // Update prices atomically
+        let mut current_prices = self.prices.load(Ordering::Acquire);
         loop {
-            let (yes_ask, _, yes_size, _) = unpack_orderbook(current);
-            let new = pack_orderbook(yes_ask, no_ask, yes_size, no_size);
-            match self.packed.compare_exchange_weak(current, new, Ordering::AcqRel, Ordering::Acquire) {
+            let (yes_ask, _) = unpack_prices(current_prices);
+            let new_prices = pack_prices(yes_ask, no_ask);
+            match self.prices.compare_exchange_weak(current_prices, new_prices, Ordering::AcqRel, Ordering::Acquire) {
                 Ok(_) => break,
-                Err(c) => current = c,
+                Err(c) => current_prices = c,
+            }
+        }
+        // Update sizes atomically
+        let mut current_sizes = self.sizes.load(Ordering::Acquire);
+        loop {
+            let (yes_size, _) = unpack_sizes(current_sizes);
+            let new_sizes = pack_sizes(yes_size, no_size);
+            match self.sizes.compare_exchange_weak(current_sizes, new_sizes, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => break,
+                Err(c) => current_sizes = c,
             }
         }
     }
@@ -487,33 +531,60 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_pack_unpack_roundtrip() {
-        // Test various values pack and unpack correctly
+    fn test_pack_unpack_prices_roundtrip() {
+        // Test various price values pack and unpack correctly
         let test_cases = vec![
-            (50, 50, 1000, 1000),  // Common mid-price
-            (1, 99, 100, 100),      // Edge prices
-            (99, 1, 65535, 65535),  // Max sizes
-            (0, 0, 0, 0),           // All zeros
-            (NO_PRICE, NO_PRICE, 0, 0),  // No prices
+            (50, 50),   // Common mid-price
+            (1, 99),    // Edge prices
+            (99, 1),    // Reversed edge
+            (0, 0),     // All zeros
+            (NO_PRICE, NO_PRICE),  // No prices
         ];
 
-        for (yes_ask, no_ask, yes_size, no_size) in test_cases {
-            let packed = pack_orderbook(yes_ask, no_ask, yes_size, no_size);
-            let (y, n, ys, ns) = unpack_orderbook(packed);
-            assert_eq!((y, n, ys, ns), (yes_ask, no_ask, yes_size, no_size),
-                "Roundtrip failed for ({}, {}, {}, {})", yes_ask, no_ask, yes_size, no_size);
+        for (yes_ask, no_ask) in test_cases {
+            let packed = pack_prices(yes_ask, no_ask);
+            let (y, n) = unpack_prices(packed);
+            assert_eq!((y, n), (yes_ask, no_ask),
+                "Prices roundtrip failed for ({}, {})", yes_ask, no_ask);
         }
     }
 
     #[test]
-    fn test_pack_bit_layout() {
-        // Verify the exact bit layout: [yes_ask:16][no_ask:16][yes_size:16][no_size:16]
-        let packed = pack_orderbook(0xABCD, 0x1234, 0x5678, 0x9ABC);
+    fn test_pack_unpack_sizes_roundtrip() {
+        // Test various size values pack and unpack correctly (now u32)
+        let test_cases: Vec<(SizeCents, SizeCents)> = vec![
+            (1000, 1000),           // Common size
+            (100, 100),             // Small size
+            (100_000, 100_000),     // $1000 in cents (was overflow before!)
+            (1_000_000, 1_000_000), // $10,000 in cents
+            (u32::MAX, u32::MAX),   // Max sizes (~$42.9M)
+            (0, 0),                 // All zeros
+        ];
 
-        assert_eq!((packed >> 48) & 0xFFFF, 0xABCD, "yes_ask should be in bits 48-63");
-        assert_eq!((packed >> 32) & 0xFFFF, 0x1234, "no_ask should be in bits 32-47");
-        assert_eq!((packed >> 16) & 0xFFFF, 0x5678, "yes_size should be in bits 16-31");
-        assert_eq!(packed & 0xFFFF, 0x9ABC, "no_size should be in bits 0-15");
+        for (yes_size, no_size) in test_cases {
+            let packed = pack_sizes(yes_size, no_size);
+            let (ys, ns) = unpack_sizes(packed);
+            assert_eq!((ys, ns), (yes_size, no_size),
+                "Sizes roundtrip failed for ({}, {})", yes_size, no_size);
+        }
+    }
+
+    #[test]
+    fn test_pack_prices_bit_layout() {
+        // Verify the exact bit layout: [yes_ask:16][no_ask:16]
+        let packed = pack_prices(0xABCD, 0x1234);
+
+        assert_eq!((packed >> 16) & 0xFFFF, 0xABCD, "yes_ask should be in bits 16-31");
+        assert_eq!(packed & 0xFFFF, 0x1234, "no_ask should be in bits 0-15");
+    }
+
+    #[test]
+    fn test_pack_sizes_bit_layout() {
+        // Verify the exact bit layout: [yes_size:32][no_size:32]
+        let packed = pack_sizes(0xABCD1234, 0x56789ABC);
+
+        assert_eq!((packed >> 32) & 0xFFFFFFFF, 0xABCD1234, "yes_size should be in bits 32-63");
+        assert_eq!(packed & 0xFFFFFFFF, 0x56789ABC, "no_size should be in bits 0-31");
     }
 
     // =========================================================================
@@ -691,76 +762,40 @@ mod tests {
     }
 
     // =========================================================================
-    // check_arbs Tests
+    // check_arbs Tests (Polymarket-only mode)
     // =========================================================================
 
+    /// Create market state for Polymarket-only arbitrage testing.
+    /// In this mode:
+    /// - kalshi.yes = Token A price (competing outcome 1)
+    /// - poly.yes = Token B price (competing outcome 2)
     fn make_market_state(
-        kalshi_yes: PriceCents,
-        kalshi_no: PriceCents,
-        poly_yes: PriceCents,
-        poly_no: PriceCents,
+        token_a_price: PriceCents,
+        token_b_price: PriceCents,
     ) -> AtomicMarketState {
         let state = AtomicMarketState::new(0);
-        state.kalshi.store(kalshi_yes, kalshi_no, 1000, 1000);
-        state.poly.store(poly_yes, poly_no, 1000, 1000);
+        // Token A stored in kalshi.yes (repurposed)
+        state.kalshi.store(token_a_price, 0, 1000, 0);
+        // Token B stored in poly.yes
+        state.poly.store(token_b_price, 0, 1000, 0);
         state
     }
 
     #[test]
-    fn test_check_arbs_poly_yes_kalshi_no() {
-        // Poly YES 40¢ + Kalshi NO 50¢ = 90¢ raw
-        // Kalshi fee on 50¢ = 2¢
-        // Effective = 92¢ → ARB (< 100¢ threshold)
-        let state = make_market_state(55, 50, 40, 65);
-
-        // threshold_cents is in cents, so 100 = $1.00
-        let mask = state.check_arbs(100);
-
-        assert!(mask & 1 != 0, "Should detect Poly YES + Kalshi NO arb (bit 0)");
-    }
-
-    #[test]
-    fn test_check_arbs_kalshi_yes_poly_no() {
-        // Kalshi YES 40¢ + Poly NO 50¢ = 90¢ raw
-        // Kalshi fee on 40¢ = 2¢
-        // Effective = 92¢ → ARB
-        let state = make_market_state(40, 65, 55, 50);
-
-        let mask = state.check_arbs(100);
-
-        assert!(mask & 2 != 0, "Should detect Kalshi YES + Poly NO arb (bit 1)");
-    }
-
-    #[test]
-    fn test_check_arbs_poly_only() {
-        // Poly YES 48¢ + Poly NO 50¢ = 98¢ → ARB (no fees!)
-        let state = make_market_state(60, 60, 48, 50);
+    fn test_check_arbs_poly_only_detected() {
+        // Token A 40¢ + Token B 48¢ = 88¢ → ARB (no fees!)
+        let state = make_market_state(40, 48);
 
         let mask = state.check_arbs(100);
 
         assert!(mask & 4 != 0, "Should detect Poly-only arb (bit 2)");
+        assert_eq!(mask, 4, "Only Poly-only arb should be detected");
     }
 
     #[test]
-    fn test_check_arbs_kalshi_only() {
-        // Kalshi YES 44¢ + Kalshi NO 44¢ = 88¢ raw
-        // Double fee: 2¢ + 2¢ = 4¢
-        // Effective = 92¢ → ARB
-        let state = make_market_state(44, 44, 60, 60);
-
-        let mask = state.check_arbs(100);
-
-        assert!(mask & 8 != 0, "Should detect Kalshi-only arb (bit 3)");
-    }
-
-    #[test]
-    fn test_check_arbs_no_arbs() {
-        // All prices efficient - no arbs
-        // Cross: 55 + 55 + 2 fee = 112 > 100
-        // Cross: 52 + 52 + 2 fee = 106 > 100
-        // Poly: 52 + 52 = 104 > 100
-        // Kalshi: 55 + 55 + 4 fee = 114 > 100
-        let state = make_market_state(55, 55, 52, 52);
+    fn test_check_arbs_no_arb_efficient_market() {
+        // Token A 52¢ + Token B 52¢ = 104¢ → NO ARB (> 100¢)
+        let state = make_market_state(52, 52);
 
         let mask = state.check_arbs(100);
 
@@ -768,42 +803,53 @@ mod tests {
     }
 
     #[test]
-    fn test_check_arbs_missing_prices() {
-        // Missing price should return no arbs
-        let state = make_market_state(50, NO_PRICE, 50, 50);
+    fn test_check_arbs_missing_token_a_price() {
+        // Missing Token A price should return no arbs
+        let state = make_market_state(NO_PRICE, 50);
 
         let mask = state.check_arbs(100);
 
-        assert_eq!(mask, 0, "Should return 0 when any price is missing");
+        assert_eq!(mask, 0, "Should return 0 when Token A price is missing");
     }
 
     #[test]
-    fn test_check_arbs_fees_eliminate_marginal() {
-        // Poly YES 49¢ + Kalshi NO 50¢ = 99¢ raw
-        // Kalshi fee on 50¢ = 2¢
-        // Effective = 101¢ → NO ARB (> 100¢ threshold)
-        let state = make_market_state(55, 50, 49, 55);
+    fn test_check_arbs_missing_token_b_price() {
+        // Missing Token B price should return no arbs
+        let state = make_market_state(50, NO_PRICE);
 
         let mask = state.check_arbs(100);
 
-        // Bit 0 should NOT be set (Poly YES + Kalshi NO = 101¢ > 100¢)
-        assert!(mask & 1 == 0, "Fees should eliminate marginal arb");
+        assert_eq!(mask, 0, "Should return 0 when Token B price is missing");
     }
 
     #[test]
-    fn test_check_arbs_multiple_arbs() {
-        // Scenario where multiple arbs exist
-        // Kalshi: YES=40, NO=40 (sum=80+4fee=84)
-        // Poly: YES=40, NO=40 (sum=80, no fees)
-        let state = make_market_state(40, 40, 40, 40);
+    fn test_check_arbs_marginal_no_arb() {
+        // Token A 50¢ + Token B 50¢ = 100¢ exactly → NO ARB (not < 100¢)
+        let state = make_market_state(50, 50);
 
         let mask = state.check_arbs(100);
 
-        // Should detect all 4 combinations
-        assert!(mask & 1 != 0, "Should detect Poly YES + Kalshi NO");
-        assert!(mask & 2 != 0, "Should detect Kalshi YES + Poly NO");
-        assert!(mask & 4 != 0, "Should detect Poly-only");
-        assert!(mask & 8 != 0, "Should detect Kalshi-only");
+        assert_eq!(mask, 0, "100¢ exactly should not be an arb (need < threshold)");
+    }
+
+    #[test]
+    fn test_check_arbs_marginal_arb() {
+        // Token A 49¢ + Token B 50¢ = 99¢ → ARB (< 100¢)
+        let state = make_market_state(49, 50);
+
+        let mask = state.check_arbs(100);
+
+        assert!(mask & 4 != 0, "99¢ should be detected as arb");
+    }
+
+    #[test]
+    fn test_check_arbs_large_profit() {
+        // Token A 30¢ + Token B 30¢ = 60¢ → Big ARB (40¢ profit!)
+        let state = make_market_state(30, 30);
+
+        let mask = state.check_arbs(100);
+
+        assert!(mask & 4 != 0, "Large price discrepancy should be detected");
     }
 
     // =========================================================================
@@ -823,6 +869,8 @@ mod tests {
             poly_no_token: format!("no_token_{}", id).into(),
             line_value: None,
             team_suffix: None,
+            category: None,
+            event_title: None,
         }
     }
 
@@ -922,48 +970,12 @@ mod tests {
     }
 
     // =========================================================================
-    // FastExecutionRequest Tests
+    // FastExecutionRequest Tests (Polymarket-only mode)
     // =========================================================================
 
     #[test]
-    fn test_execution_request_profit_cents_poly_yes_kalshi_no() {
-        // Poly YES 40¢ + Kalshi NO 50¢ = 90¢
-        // Kalshi fee on 50¢ = 2¢
-        // Profit = 100 - 90 - 2 = 8¢
-        let req = FastExecutionRequest {
-            market_id: 0,
-            yes_price: 40,
-            no_price: 50,
-            yes_size: 1000,
-            no_size: 1000,
-            arb_type: ArbType::PolyYesKalshiNo,
-            detected_ns: 0,
-        };
-
-        assert_eq!(req.profit_cents(), 8);
-    }
-
-    #[test]
-    fn test_execution_request_profit_cents_kalshi_yes_poly_no() {
-        // Kalshi YES 40¢ + Poly NO 50¢ = 90¢
-        // Kalshi fee on 40¢ = 2¢
-        // Profit = 100 - 90 - 2 = 8¢
-        let req = FastExecutionRequest {
-            market_id: 0,
-            yes_price: 40,
-            no_price: 50,
-            yes_size: 1000,
-            no_size: 1000,
-            arb_type: ArbType::KalshiYesPolyNo,
-            detected_ns: 0,
-        };
-
-        assert_eq!(req.profit_cents(), 8);
-    }
-
-    #[test]
     fn test_execution_request_profit_cents_poly_only() {
-        // Poly YES 40¢ + Poly NO 48¢ = 88¢
+        // Poly Token A 40¢ + Poly Token B 48¢ = 88¢
         // No fees on Polymarket
         // Profit = 100 - 88 - 0 = 12¢
         let req = FastExecutionRequest {
@@ -981,25 +993,6 @@ mod tests {
     }
 
     #[test]
-    fn test_execution_request_profit_cents_kalshi_only() {
-        // Kalshi YES 40¢ + Kalshi NO 44¢ = 84¢
-        // Kalshi fee on both: 2¢ + 2¢ = 4¢
-        // Profit = 100 - 84 - 4 = 12¢
-        let req = FastExecutionRequest {
-            market_id: 0,
-            yes_price: 40,
-            no_price: 44,
-            yes_size: 1000,
-            no_size: 1000,
-            arb_type: ArbType::KalshiOnly,
-            detected_ns: 0,
-        };
-
-        assert_eq!(req.profit_cents(), 12);
-        assert_eq!(req.estimated_fee_cents(), kalshi_fee_cents(40) + kalshi_fee_cents(44));
-    }
-
-    #[test]
     fn test_execution_request_negative_profit() {
         // Prices too high - no profit
         let req = FastExecutionRequest {
@@ -1008,7 +1001,7 @@ mod tests {
             no_price: 52,
             yes_size: 1000,
             no_size: 1000,
-            arb_type: ArbType::PolyYesKalshiNo,
+            arb_type: ArbType::PolyOnly,
             detected_ns: 0,
         };
 
@@ -1016,33 +1009,9 @@ mod tests {
     }
 
     #[test]
-    fn test_execution_request_estimated_fee() {
-        // PolyYesKalshiNo → fee on Kalshi NO
-        let req1 = FastExecutionRequest {
-            market_id: 0,
-            yes_price: 40,
-            no_price: 50,
-            yes_size: 1000,
-            no_size: 1000,
-            arb_type: ArbType::PolyYesKalshiNo,
-            detected_ns: 0,
-        };
-        assert_eq!(req1.estimated_fee_cents(), kalshi_fee_cents(50));
-
-        // KalshiYesPolyNo → fee on Kalshi YES
-        let req2 = FastExecutionRequest {
-            market_id: 0,
-            yes_price: 40,
-            no_price: 50,
-            yes_size: 1000,
-            no_size: 1000,
-            arb_type: ArbType::KalshiYesPolyNo,
-            detected_ns: 0,
-        };
-        assert_eq!(req2.estimated_fee_cents(), kalshi_fee_cents(40));
-
+    fn test_execution_request_poly_only_no_fees() {
         // PolyOnly → no fees
-        let req3 = FastExecutionRequest {
+        let req = FastExecutionRequest {
             market_id: 0,
             yes_price: 40,
             no_price: 50,
@@ -1051,19 +1020,7 @@ mod tests {
             arb_type: ArbType::PolyOnly,
             detected_ns: 0,
         };
-        assert_eq!(req3.estimated_fee_cents(), 0);
-
-        // KalshiOnly → fees on both sides
-        let req4 = FastExecutionRequest {
-            market_id: 0,
-            yes_price: 40,
-            no_price: 50,
-            yes_size: 1000,
-            no_size: 1000,
-            arb_type: ArbType::KalshiOnly,
-            detected_ns: 0,
-        };
-        assert_eq!(req4.estimated_fee_cents(), kalshi_fee_cents(40) + kalshi_fee_cents(50));
+        assert_eq!(req.estimated_fee_cents(), 0);
     }
 
     // =========================================================================
@@ -1090,64 +1047,70 @@ mod tests {
 
     #[test]
     fn test_full_arb_flow() {
-        // Simulate the full flow: add market, update prices, detect arb
+        // Simulate the full flow: add market, update prices, detect arb (Polymarket-only)
         let mut state = GlobalState::new();
 
-        // 1. Add market during discovery
+        // 1. Add market during discovery (competing outcomes in same event)
         let pair = MarketPair {
             pair_id: "test-arb".into(),
             league: "epl".into(),
             market_type: MarketType::Moneyline,
             description: "Chelsea vs Arsenal".into(),
-            kalshi_event_ticker: "KXEPLGAME-25DEC27CFCARS".into(),
-            kalshi_market_ticker: "KXEPLGAME-25DEC27CFCARS-CFC".into(),
+            kalshi_event_ticker: "token-a-condition".into(),
+            kalshi_market_ticker: "token-a-condition".into(),
             poly_slug: "chelsea-vs-arsenal".into(),
-            poly_yes_token: "yes_token_cfc".into(),
-            poly_no_token: "no_token_cfc".into(),
+            poly_yes_token: "token_a_chelsea".into(),  // Token A (Chelsea)
+            poly_no_token: "token_b_arsenal".into(),    // Token B (Arsenal)
             line_value: None,
             team_suffix: Some("CFC".into()),
+            category: None,
+            event_title: None,
         };
 
         let poly_yes_token = pair.poly_yes_token.clone();
-        let kalshi_ticker = pair.kalshi_market_ticker.clone();
+        let poly_no_token = pair.poly_no_token.clone();
 
         let market_id = state.add_pair(pair).unwrap();
 
-        // 2. Simulate WebSocket updates setting prices
-        // Kalshi update
-        let kalshi_hash = fxhash_str(&kalshi_ticker);
-        if let Some(id) = state.kalshi_to_id.get(&kalshi_hash) {
-            state.markets[*id as usize].kalshi.store(55, 50, 500, 600);
+        // 2. Simulate WebSocket updates for both Polymarket tokens
+        // Token A (Chelsea) price update - stored in kalshi field (repurposed)
+        let poly_yes_hash = fxhash_str(&poly_yes_token);
+        if let Some(id) = state.poly_yes_to_id.get(&poly_yes_hash) {
+            // Token A YES = 40¢
+            state.markets[*id as usize].kalshi.store(40, 0, 500, 0);
         }
 
-        // Polymarket update
-        let poly_hash = fxhash_str(&poly_yes_token);
-        if let Some(id) = state.poly_yes_to_id.get(&poly_hash) {
-            state.markets[*id as usize].poly.store(40, 65, 700, 800);
+        // Token B (Arsenal) price update - stored in poly field
+        let poly_no_hash = fxhash_str(&poly_no_token);
+        if let Some(id) = state.poly_no_to_id.get(&poly_no_hash) {
+            // Token B YES = 48¢
+            state.markets[*id as usize].poly.store(48, 0, 700, 0);
         }
 
         // 3. Check for arbs (threshold = 100 cents = $1.00)
+        // Token A (40¢) + Token B (48¢) = 88¢ < 100¢ → ARB!
         let market = state.get_by_id(market_id).unwrap();
         let arb_mask = market.check_arbs(100);
 
-        // 4. Verify arb detected
-        assert!(arb_mask & 1 != 0, "Should detect Poly YES + Kalshi NO arb");
+        // 4. Verify arb detected (bit 2 = Poly-only arb)
+        assert!(arb_mask & 4 != 0, "Should detect Poly-only arb (Token A + Token B < 100¢)");
 
         // 5. Build execution request
-        let (p_yes, _, p_yes_sz, _) = market.poly.load();
-        let (_, k_no, _, k_no_sz) = market.kalshi.load();
+        let (token_a_price, _, token_a_sz, _) = market.kalshi.load();
+        let (token_b_price, _, token_b_sz, _) = market.poly.load();
 
         let req = FastExecutionRequest {
             market_id,
-            yes_price: p_yes,
-            no_price: k_no,
-            yes_size: p_yes_sz,
-            no_size: k_no_sz,
-            arb_type: ArbType::PolyYesKalshiNo,
+            yes_price: token_a_price,
+            no_price: token_b_price,
+            yes_size: token_a_sz,
+            no_size: token_b_sz,
+            arb_type: ArbType::PolyOnly,
             detected_ns: 0,
         };
 
-        assert!(req.profit_cents() > 0, "Should have positive profit");
+        // Profit = 100 - 40 - 48 - 0 (no fees) = 12¢
+        assert_eq!(req.profit_cents(), 12, "Should have 12¢ profit");
     }
 
     #[test]
@@ -1167,10 +1130,10 @@ mod tests {
                     let market = &state.markets[0];
                     if i % 2 == 0 {
                         // Simulate Kalshi updates
-                        market.kalshi.update_yes(40 + ((j % 10) as u16), 500 + j as u16);
+                        market.kalshi.update_yes(40 + ((j % 10) as u16), 500 + j as u32);
                     } else {
                         // Simulate Poly updates
-                        market.poly.update_no(50 + ((j % 10) as u16), 600 + j as u16);
+                        market.poly.update_no(50 + ((j % 10) as u16), 600 + j as u32);
                     }
 
                     // Check arbs (should never panic) - threshold = 100 cents

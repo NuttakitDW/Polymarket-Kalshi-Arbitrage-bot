@@ -13,7 +13,7 @@ use tokio::time::{interval, Instant};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{error, info, warn};
 
-use crate::config::{POLYMARKET_WS_URL, POLY_PING_INTERVAL_SECS};
+use crate::config::{POLYMARKET_WS_URL, POLY_PING_INTERVAL_SECS, store_all_arb_enabled};
 use crate::execution::NanoClock;
 use crate::storage::{ArbSnapshotRecord, StorageChannel};
 use crate::types::{
@@ -57,6 +57,8 @@ pub struct PriceChangeItem {
     pub asset_id: String,
     #[allow(dead_code)]
     pub price: Option<String>,
+    /// Size of the order that changed (not total liquidity at best_ask)
+    pub size: Option<String>,
     #[allow(dead_code)]
     pub side: Option<String>,
     /// Best ask price - this is what we care about for arbitrage
@@ -455,7 +457,8 @@ async fn process_book(
 
         // Check arbs
         let arb_mask = market.check_arbs(threshold_cents);
-        if arb_mask != 0 {
+        // Call send_arb_request if: arb detected OR store_all mode enabled
+        if arb_mask != 0 || store_all_arb_enabled() {
             send_arb_request(market_id, market, arb_mask, exec_tx, clock, storage).await;
         }
     }
@@ -467,7 +470,8 @@ async fn process_book(
 
         // Check arbs
         let arb_mask = market.check_arbs(threshold_cents);
-        if arb_mask != 0 {
+        // Call send_arb_request if: arb detected OR store_all mode enabled
+        if arb_mask != 0 || store_all_arb_enabled() {
             send_arb_request(market_id, market, arb_mask, exec_tx, clock, storage).await;
         }
     }
@@ -500,6 +504,12 @@ async fn process_price_change(
               pc_num, &change.asset_id[..change.asset_id.len().min(30)], price_str, found_yes, found_no);
     }
 
+    // Parse size from event if available (size of the order that changed, in dollars -> cents)
+    // Note: This is a single order's size, not total liquidity at best_ask
+    let event_size: Option<SizeCents> = change.size.as_ref()
+        .and_then(|s| s.parse::<f64>().ok())
+        .map(|size| (size * 100.0).round() as SizeCents);
+
     // Check Token A (repurposed from YES token)
     if let Some(&market_id) = state.poly_yes_to_id.get(&token_hash) {
         let market = &state.markets[market_id as usize];
@@ -507,10 +517,18 @@ async fn process_price_change(
 
         // Update price (best_ask is always the current best, so always update)
         if price != current_yes {
-            market.kalshi.update_yes(price, current_yes_size.max(100)); // Use minimum size of 100 cents
+            // Keep existing size from BookSnapshot. Price_change size is a single order,
+            // not total liquidity. Only use event_size if we have no size yet (0).
+            let new_size = if current_yes_size == 0 {
+                event_size.unwrap_or(0)
+            } else {
+                current_yes_size
+            };
+            market.kalshi.update_yes(price, new_size);
 
             let arb_mask = market.check_arbs(threshold_cents);
-            if arb_mask != 0 {
+            // Call send_arb_request if: arb detected OR store_all mode enabled
+            if arb_mask != 0 || store_all_arb_enabled() {
                 send_arb_request(market_id, market, arb_mask, exec_tx, clock, storage).await;
             }
         }
@@ -521,10 +539,18 @@ async fn process_price_change(
         let (current_yes, _, current_yes_size, _) = market.poly.load();
 
         if price != current_yes {
-            market.poly.update_yes(price, current_yes_size.max(100)); // Use minimum size of 100 cents
+            // Keep existing size from BookSnapshot. Price_change size is a single order,
+            // not total liquidity. Only use event_size if we have no size yet (0).
+            let new_size = if current_yes_size == 0 {
+                event_size.unwrap_or(0)
+            } else {
+                current_yes_size
+            };
+            market.poly.update_yes(price, new_size);
 
             let arb_mask = market.check_arbs(threshold_cents);
-            if arb_mask != 0 {
+            // Call send_arb_request if: arb detected OR store_all mode enabled
+            if arb_mask != 0 || store_all_arb_enabled() {
                 send_arb_request(market_id, market, arb_mask, exec_tx, clock, storage).await;
             }
         }
@@ -557,14 +583,19 @@ async fn send_arb_request(
     let (yes_ask, _yes_bid, yes_size, _) = market.kalshi.load();
     let (no_ask, _no_bid, no_size, _) = market.poly.load();
 
-    // Priority order: Polymarket-only (competing outcomes) - NO FEES!
-    let (yes_price, no_price, yes_sz, no_sz, arb_type) = if arb_mask & 4 != 0 {
-        // Poly only: YES + NO (competing outcomes)
-        (yes_ask, no_ask, yes_size, no_size, ArbType::PolyOnly)
-    } else {
-        // No other arb types supported in Polymarket-only mode
+    // Need both prices to record meaningful data
+    if yes_ask == 0 || no_ask == 0 {
         return;
-    };
+    }
+
+    // Use current prices for storage (even if no arb detected)
+    let yes_price = yes_ask;
+    let no_price = no_ask;
+    let yes_sz = yes_size;
+    let no_sz = no_size;
+
+    // Check if this is an actual arb opportunity (arb_mask & 4 = Poly-only arb)
+    let is_profitable_arb = arb_mask & 4 != 0;
 
     let detected_ns = clock.now_ns();
     let total_cost = yes_price + no_price;
@@ -575,26 +606,47 @@ async fn send_arb_request(
     let min_size = yes_sz.min(no_sz) as u32;
     let max_profit_cents = (profit_per_contract as u32 * min_size) / 100;
 
-    // Record arb opportunity to SQLite storage
-    if let Some(pair) = &market.pair {
-        let now = chrono::Utc::now();
-        storage.record_arb(ArbSnapshotRecord {
-            pair_id: pair.pair_id.to_string(),
-            timestamp_secs: now.timestamp(),
-            timestamp_ns: (detected_ns % 1_000_000_000) as u32,
-            yes_ask: yes_price,
-            yes_size: yes_sz,
-            no_ask: no_price,
-            no_size: no_sz,
-            total_cost,
-            gap_cents,
-            profit_per_contract,
-            max_profit_cents,
-            description: Some(pair.description.to_string()),
-            event_title: pair.event_title.as_ref().map(|s| s.to_string()),
-            categories: categories_to_json(&pair.category),
-            running_type: storage.running_type.clone(),
-        });
+    // Check if order value meets $1 minimum per leg
+    // Order value = (contracts) × price = (min_size/100) × price_cents
+    // For $1 minimum: (min_size/100) × price >= 100 cents
+    // Simplified: min_size × price >= 10000
+    const MIN_ORDER_VALUE_THRESHOLD: u32 = 10000; // $1.00 per leg
+    let yes_order_value = min_size * yes_price as u32;
+    let no_order_value = min_size * no_price as u32;
+    let meets_threshold = yes_order_value >= MIN_ORDER_VALUE_THRESHOLD
+        && no_order_value >= MIN_ORDER_VALUE_THRESHOLD;
+
+    // Record to SQLite storage
+    // When STORE_ALL_ARB=1: store ALL price snapshots for verification
+    // Otherwise: only store profitable arbs that meet the $1 minimum threshold
+    let should_store = store_all_arb_enabled() || (is_profitable_arb && meets_threshold);
+
+    if should_store {
+        if let Some(pair) = &market.pair {
+            let now = chrono::Utc::now();
+            storage.record_arb(ArbSnapshotRecord {
+                pair_id: pair.pair_id.to_string(),
+                timestamp_secs: now.timestamp(),
+                timestamp_ns: (detected_ns % 1_000_000_000) as u32,
+                yes_ask: yes_price,
+                yes_size: yes_sz,
+                no_ask: no_price,
+                no_size: no_sz,
+                total_cost,
+                gap_cents,
+                profit_per_contract,
+                max_profit_cents,
+                description: Some(pair.description.to_string()),
+                event_title: pair.event_title.as_ref().map(|s| s.to_string()),
+                categories: categories_to_json(&pair.category),
+                running_type: storage.running_type.clone(),
+            });
+        }
+    }
+
+    // Only execute if: profitable arb detected AND meets threshold
+    if !is_profitable_arb || !meets_threshold {
+        return;
     }
 
     let req = FastExecutionRequest {
@@ -603,7 +655,7 @@ async fn send_arb_request(
         no_price,
         yes_size: yes_sz,
         no_size: no_sz,
-        arb_type,
+        arb_type: ArbType::PolyOnly,
         detected_ns,
     };
 

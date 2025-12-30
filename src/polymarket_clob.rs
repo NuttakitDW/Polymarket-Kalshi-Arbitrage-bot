@@ -451,6 +451,20 @@ impl PolymarketAsyncClient {
         Ok(headers)
     }
 
+    /// Create new API credentials (POST /auth/api-key)
+    /// Note: Used by test_trading binary via create_or_derive_api_key
+    pub async fn create_api_key(&self, nonce: u64) -> Result<ApiCreds> {
+        let url = format!("{}/auth/api-key", self.host);
+        let headers = self.build_l1_headers(nonce)?;
+        let resp = self.http.post(&url).headers(headers).send().await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(anyhow!("create-api-key failed: {} {}", status, body));
+        }
+        Ok(resp.json().await?)
+    }
+
     /// Derive API credentials from L1 wallet signature
     pub async fn derive_api_key(&self, nonce: u64) -> Result<ApiCreds> {
         let url = format!("{}/auth/derive-api-key", self.host);
@@ -462,6 +476,18 @@ impl PolymarketAsyncClient {
             return Err(anyhow!("derive-api-key failed: {} {}", status, body));
         }
         Ok(resp.json().await?)
+    }
+
+    /// Create or derive API credentials (tries create first, falls back to derive)
+    pub async fn create_or_derive_api_key(&self, nonce: u64) -> Result<ApiCreds> {
+        // Try to create first
+        match self.create_api_key(nonce).await {
+            Ok(creds) => Ok(creds),
+            Err(_) => {
+                // If create fails (already exists), try to derive
+                self.derive_api_key(nonce).await
+            }
+        }
     }
 
     /// Build L2 headers for authenticated requests
@@ -553,16 +579,22 @@ pub struct SharedAsyncClient {
     inner: Arc<PolymarketAsyncClient>,
     creds: PreparedCreds,
     chain_id: u64,
+    /// Signature type: 1 = Magic/Email, 2 = Browser wallet (MetaMask)
+    signature_type: i32,
     /// Pre-cached neg_risk lookups
     neg_risk_cache: std::sync::RwLock<HashMap<String, bool>>,
 }
 
 impl SharedAsyncClient {
-    pub fn new(client: PolymarketAsyncClient, creds: PreparedCreds, chain_id: u64) -> Self {
+    /// Create with specific signature_type
+    /// - signature_type=1: Magic/Email wallet
+    /// - signature_type=2: Browser wallet (MetaMask, Coinbase Wallet, etc.)
+    pub fn with_signature_type(client: PolymarketAsyncClient, creds: PreparedCreds, chain_id: u64, signature_type: i32) -> Self {
         Self {
             inner: Arc::new(client),
             creds,
             chain_id,
+            signature_type,
             neg_risk_cache: std::sync::RwLock::new(HashMap::new()),
         }
     }
@@ -584,9 +616,10 @@ impl SharedAsyncClient {
     }
 
     async fn execute_order(&self, token_id: &str, price: f64, size: f64, side: &str) -> Result<PolyFillAsync> {
-        // Check neg_risk cache first
+        // Check neg_risk cache first (handle poisoned lock gracefully)
         let neg_risk = {
-            let cache = self.neg_risk_cache.read().unwrap();
+            let cache = self.neg_risk_cache.read()
+                .map_err(|e| anyhow!("Cache read lock poisoned: {}", e))?;
             cache.get(token_id).copied()
         };
 
@@ -594,7 +627,8 @@ impl SharedAsyncClient {
             Some(nr) => nr,
             None => {
                 let nr = self.inner.check_neg_risk(token_id).await?;
-                let mut cache = self.neg_risk_cache.write().unwrap();
+                let mut cache = self.neg_risk_cache.write()
+                    .map_err(|e| anyhow!("Cache write lock poisoned: {}", e))?;
                 cache.insert(token_id.to_string(), nr);
                 nr
             }
@@ -662,7 +696,7 @@ impl SharedAsyncClient {
         let maker_amount_str = maker_amt.to_string();
         let taker_amount_str = taker_amt.to_string();
 
-        // Use references for EIP712 signing 
+        // Use references for EIP712 signing
         let data = OrderData {
             maker: &self.inner.funder,
             taker: ZERO_ADDRESS,
@@ -674,7 +708,7 @@ impl SharedAsyncClient {
             nonce: "0",
             signer: &self.inner.wallet_address_str,
             expiration: "0",
-            signature_type: 1,
+            signature_type: self.signature_type,
             salt,
         };
         let exchange = get_exchange_address(self.chain_id, neg_risk)?;
@@ -697,7 +731,7 @@ impl SharedAsyncClient {
                 nonce: "0".to_string(),
                 fee_rate_bps: "0".to_string(),
                 side: side_code,
-                signature_type: 1,
+                signature_type: self.signature_type,
             },
             signature: format!("0x{}", sig),
         })

@@ -45,6 +45,33 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
         [],
     )?;
 
+    // Trades table: executed trade transactions
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            market_id INTEGER NOT NULL,
+            timestamp INTEGER NOT NULL,
+            timestamp_ns INTEGER NOT NULL,
+            yes_order_id TEXT NOT NULL,
+            no_order_id TEXT NOT NULL,
+            yes_filled INTEGER NOT NULL,
+            no_filled INTEGER NOT NULL,
+            matched_contracts INTEGER NOT NULL,
+            yes_cost_cents INTEGER NOT NULL,
+            no_cost_cents INTEGER NOT NULL,
+            total_cost_cents INTEGER NOT NULL,
+            profit_cents INTEGER NOT NULL,
+            yes_price INTEGER NOT NULL,
+            no_price INTEGER NOT NULL,
+            latency_us INTEGER NOT NULL,
+            success INTEGER NOT NULL,
+            error TEXT,
+            running_type TEXT NOT NULL,
+            FOREIGN KEY (market_id) REFERENCES markets(id)
+        )",
+        [],
+    )?;
+
     // Indexes for efficient queries
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_arb_time ON arb_snapshots(timestamp DESC)",
@@ -94,6 +121,24 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
     // Index for running_type filtering
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_arb_running_type ON arb_snapshots(running_type)",
+        [],
+    )?;
+
+    // Indexes for trades table
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_trades_time ON trades(timestamp DESC)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_trades_market_time ON trades(market_id, timestamp DESC)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_trades_success ON trades(success)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_trades_running_type ON trades(running_type)",
         [],
     )?;
 

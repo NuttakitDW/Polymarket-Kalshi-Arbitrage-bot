@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{info, warn, error};
 
+use crate::config::MAX_PORTFOLIO_CENTS;
 use crate::polymarket_clob::SharedAsyncClient;
 use crate::types::{
     ArbType, MarketPair,
@@ -18,6 +19,7 @@ use crate::types::{
 };
 use crate::circuit_breaker::CircuitBreaker;
 use crate::position_tracker::{FillRecord, PositionChannel};
+use crate::storage::{StorageChannel, TradeRecord};
 
 // =============================================================================
 // EXECUTION ENGINE
@@ -51,6 +53,7 @@ pub struct ExecutionEngine {
     state: Arc<GlobalState>,
     circuit_breaker: Arc<CircuitBreaker>,
     position_channel: PositionChannel,
+    storage: StorageChannel,
     in_flight: Arc<[AtomicU64; 8]>,
     clock: NanoClock,
     pub dry_run: bool,
@@ -63,6 +66,7 @@ impl ExecutionEngine {
         state: Arc<GlobalState>,
         circuit_breaker: Arc<CircuitBreaker>,
         position_channel: PositionChannel,
+        storage: StorageChannel,
         dry_run: bool,
     ) -> Self {
         let test_mode = std::env::var("TEST_ARB")
@@ -74,6 +78,7 @@ impl ExecutionEngine {
             state,
             circuit_breaker,
             position_channel,
+            storage,
             in_flight: Arc::new(std::array::from_fn(|_| AtomicU64::new(0))),
             clock: NanoClock::new(),
             dry_run,
@@ -123,22 +128,43 @@ impl ExecutionEngine {
             });
         }
 
-        // Calculate max contracts from size (min of both sides)
-        let mut max_contracts = (req.yes_size.min(req.no_size) / 100) as i64;
+        // Polymarket enforces $1 minimum order value per leg
+        const MIN_ORDER_VALUE_CENTS: u32 = 100; // $1.00
+
+        let cost_per_contract = req.yes_price as u32 + req.no_price as u32;
+
+        // Step 1: Calculate minimum contracts needed for $1 per leg
+        // min_contracts = max(ceil(100/yes_price), ceil(100/no_price))
+        let min_for_yes = (MIN_ORDER_VALUE_CENTS + req.yes_price as u32 - 1) / req.yes_price as u32;
+        let min_for_no = (MIN_ORDER_VALUE_CENTS + req.no_price as u32 - 1) / req.no_price as u32;
+        let min_contracts = min_for_yes.max(min_for_no) as i64;
+
+        // Step 2: Calculate max contracts from liquidity and budget
+        let max_from_liquidity = (req.yes_size.min(req.no_size) / 100) as i64;
+        let max_affordable = (MAX_PORTFOLIO_CENTS / cost_per_contract) as i64;
+
+        // Step 3: Final position size = min(liquidity, affordable) - trade what we can afford
+        let mut max_contracts = max_from_liquidity.min(max_affordable);
+
+        // Log if we're capping due to portfolio limit
+        if max_from_liquidity > max_affordable {
+            info!("[EXEC] 💰 Portfolio cap: {} → {} contracts (${:.2} budget)",
+                  max_from_liquidity, max_affordable, MAX_PORTFOLIO_CENTS as f64 / 100.0);
+        }
 
         // Safety: In test mode, cap position size at 10 contracts
-        // Note: Polymarket enforces a $1 minimum order value. At 40¢ per contract,
-        // a single contract ($0.40) would be rejected. Using 10 contracts ensures
-        // we meet the minimum requirement at any reasonable price level.
         if self.test_mode && max_contracts > 10 {
             warn!("[EXEC] ⚠️ TEST_MODE: Position size capped from {} to 10 contracts", max_contracts);
             max_contracts = 10;
         }
 
-        if max_contracts < 1 {
+        // Step 4: Validate we can meet $1 minimum per leg (Polymarket requirement)
+        if max_contracts < min_contracts {
             warn!(
-                "[EXEC] Liquidity fail: {:?} | yes_size={}¢ no_size={}¢",
-                req.arb_type, req.yes_size, req.no_size
+                "[EXEC] Can't meet $1 minimum per leg: {:?} | \
+                 need {} contracts but can only do {} (liquidity={}, budget=${})",
+                req.arb_type, min_contracts, max_contracts,
+                max_from_liquidity, MAX_PORTFOLIO_CENTS as f64 / 100.0
             );
             self.release_in_flight(market_id);
             return Ok(ExecutionResult {
@@ -146,9 +172,21 @@ impl ExecutionEngine {
                 success: false,
                 profit_cents: 0,
                 latency_ns: self.clock.now_ns() - req.detected_ns,
-                error: Some("Insufficient liquidity"),
+                error: Some("Can't meet $1 minimum per leg"),
             });
         }
+
+        // Log final position sizing
+        let yes_order_value = max_contracts as u32 * req.yes_price as u32;
+        let no_order_value = max_contracts as u32 * req.no_price as u32;
+        let total_cost = max_contracts as u32 * cost_per_contract;
+        info!(
+            "[EXEC] Position: {} contracts | YES=${:.2} ({} × {}¢) NO=${:.2} ({} × {}¢) | Total=${:.2}",
+            max_contracts,
+            yes_order_value as f64 / 100.0, max_contracts, req.yes_price,
+            no_order_value as f64 / 100.0, max_contracts, req.no_price,
+            total_cost as f64 / 100.0
+        );
 
         // Circuit breaker check
         if let Err(_reason) = self.circuit_breaker.can_execute(&pair.pair_id, max_contracts).await {
@@ -246,21 +284,72 @@ impl ExecutionEngine {
                     ));
                 }
 
+                let latency_ns = self.clock.now_ns() - req.detected_ns;
+
+                // Record trade to SQLite storage
+                let now = chrono::Utc::now();
+                self.storage.record_trade(TradeRecord {
+                    pair_id: pair.pair_id.to_string(),
+                    timestamp_secs: now.timestamp(),
+                    timestamp_ns: (latency_ns % 1_000_000_000) as u32,
+                    yes_order_id: yes_order_id.clone(),
+                    no_order_id: no_order_id.clone(),
+                    yes_filled,
+                    no_filled,
+                    matched_contracts: matched,
+                    yes_cost_cents: yes_cost,
+                    no_cost_cents: no_cost,
+                    total_cost_cents: yes_cost + no_cost,
+                    profit_cents: actual_profit as i64,
+                    yes_price: req.yes_price,
+                    no_price: req.no_price,
+                    latency_us: latency_ns / 1000,
+                    success,
+                    error: if success { None } else { Some("Partial/no fill".to_string()) },
+                    running_type: self.storage.running_type.clone(),
+                });
+
                 Ok(ExecutionResult {
                     market_id,
                     success,
                     profit_cents: actual_profit,
-                    latency_ns: self.clock.now_ns() - req.detected_ns,
+                    latency_ns,
                     error: if success { None } else { Some("Partial/no fill") },
                 })
             }
-            Err(_e) => {
+            Err(e) => {
                 self.circuit_breaker.record_error().await;
+
+                let latency_ns = self.clock.now_ns() - req.detected_ns;
+
+                // Record failed trade to SQLite storage
+                let now = chrono::Utc::now();
+                self.storage.record_trade(TradeRecord {
+                    pair_id: pair.pair_id.to_string(),
+                    timestamp_secs: now.timestamp(),
+                    timestamp_ns: (latency_ns % 1_000_000_000) as u32,
+                    yes_order_id: String::new(),
+                    no_order_id: String::new(),
+                    yes_filled: 0,
+                    no_filled: 0,
+                    matched_contracts: 0,
+                    yes_cost_cents: 0,
+                    no_cost_cents: 0,
+                    total_cost_cents: 0,
+                    profit_cents: 0,
+                    yes_price: req.yes_price,
+                    no_price: req.no_price,
+                    latency_us: latency_ns / 1000,
+                    success: false,
+                    error: Some(e.to_string()),
+                    running_type: self.storage.running_type.clone(),
+                });
+
                 Ok(ExecutionResult {
                     market_id,
                     success: false,
                     profit_cents: 0,
-                    latency_ns: self.clock.now_ns() - req.detected_ns,
+                    latency_ns,
                     error: Some("Execution failed"),
                 })
             }
@@ -274,7 +363,9 @@ impl ExecutionEngine {
         contracts: i64,
     ) -> Result<(i64, i64, i64, i64, String, String)> {
         // Polymarket-only: Token A YES + Token B YES (competing outcomes)
-        assert_eq!(req.arb_type, ArbType::PolyOnly, "Only PolyOnly arbitrage is supported");
+        if req.arb_type != ArbType::PolyOnly {
+            return Err(anyhow!("Only PolyOnly arbitrage is supported, got {:?}", req.arb_type));
+        }
 
         let token_a_fut = self.poly_async.buy_fak(
             &pair.poly_yes_token,

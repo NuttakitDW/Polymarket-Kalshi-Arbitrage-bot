@@ -9,7 +9,7 @@ use rusqlite::Connection;
 use tracing::{error, info, warn};
 
 use super::schema::create_tables;
-use super::types::{ArbSnapshotRecord, MarketMetadataRecord};
+use super::types::{ArbSnapshotRecord, MarketMetadataRecord, TradeRecord};
 
 /// Messages sent to the storage writer thread.
 pub enum StorageMessage {
@@ -17,6 +17,8 @@ pub enum StorageMessage {
     NewMarket(MarketMetadataRecord),
     /// Record an arbitrage opportunity snapshot
     ArbSnapshot(ArbSnapshotRecord),
+    /// Record an executed trade transaction
+    Trade(TradeRecord),
     /// Graceful shutdown
     #[allow(dead_code)]
     Shutdown,
@@ -39,6 +41,11 @@ impl StorageChannel {
     /// Record an arbitrage opportunity snapshot.
     pub fn record_arb(&self, snapshot: ArbSnapshotRecord) {
         let _ = self.tx.send(StorageMessage::ArbSnapshot(snapshot));
+    }
+
+    /// Record an executed trade transaction.
+    pub fn record_trade(&self, trade: TradeRecord) {
+        let _ = self.tx.send(StorageMessage::Trade(trade));
     }
 
     /// Request graceful shutdown.
@@ -160,6 +167,7 @@ fn flush_batch(
 
     let mut arb_count = 0;
     let mut market_count = 0;
+    let mut trade_count = 0;
 
     for msg in batch.drain(..) {
         match msg {
@@ -173,16 +181,21 @@ fn flush_batch(
                     arb_count += 1;
                 }
             }
+            StorageMessage::Trade(t) => {
+                if insert_trade(&tx, &t, market_ids) {
+                    trade_count += 1;
+                }
+            }
             StorageMessage::Shutdown => {}
         }
     }
 
     if let Err(e) = tx.commit() {
         error!("[STORAGE] Failed to commit transaction: {}", e);
-    } else if arb_count > 0 || market_count > 0 {
+    } else if arb_count > 0 || market_count > 0 || trade_count > 0 {
         info!(
-            "[STORAGE] Flushed {} arb snapshots, {} new markets",
-            arb_count, market_count
+            "[STORAGE] Flushed {} arb snapshots, {} trades, {} new markets",
+            arb_count, trade_count, market_count
         );
     }
 }
@@ -284,6 +297,57 @@ fn insert_arb_snapshot(
         Ok(_) => true,
         Err(e) => {
             warn!("[STORAGE] Failed to insert arb snapshot: {}", e);
+            false
+        }
+    }
+}
+
+/// Insert trade record, returns true if successful.
+fn insert_trade(
+    conn: &Connection,
+    trade: &TradeRecord,
+    market_ids: &HashMap<String, i64>,
+) -> bool {
+    let market_id = match market_ids.get(&trade.pair_id) {
+        Some(id) => *id,
+        None => {
+            warn!(
+                "[STORAGE] Unknown market {} for trade, skipping",
+                trade.pair_id
+            );
+            return false;
+        }
+    };
+
+    let result = conn.execute(
+        "INSERT INTO trades (market_id, timestamp, timestamp_ns, yes_order_id, no_order_id, yes_filled, no_filled, matched_contracts, yes_cost_cents, no_cost_cents, total_cost_cents, profit_cents, yes_price, no_price, latency_us, success, error, running_type)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+        rusqlite::params![
+            market_id,
+            trade.timestamp_secs,
+            trade.timestamp_ns,
+            trade.yes_order_id,
+            trade.no_order_id,
+            trade.yes_filled,
+            trade.no_filled,
+            trade.matched_contracts,
+            trade.yes_cost_cents,
+            trade.no_cost_cents,
+            trade.total_cost_cents,
+            trade.profit_cents,
+            trade.yes_price,
+            trade.no_price,
+            trade.latency_us,
+            trade.success as i32,
+            trade.error,
+            trade.running_type,
+        ],
+    );
+
+    match result {
+        Ok(_) => true,
+        Err(e) => {
+            warn!("[STORAGE] Failed to insert trade: {}", e);
             false
         }
     }

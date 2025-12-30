@@ -7,5 +7,5 @@ pub mod schema;
 pub mod types;
 pub mod writer;
 
-pub use types::{ArbSnapshotRecord, MarketMetadataRecord};
+pub use types::{ArbSnapshotRecord, MarketMetadataRecord, TradeRecord};
 pub use writer::{create_storage_channel, StorageChannel};

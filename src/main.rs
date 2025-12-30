@@ -40,7 +40,7 @@ use tracing::{error, info, warn};
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
-use config::{ARB_THRESHOLD, ENABLED_LEAGUES, WS_RECONNECT_DELAY_SECS};
+use config::{ARB_THRESHOLD, ENABLED_LEAGUES, WS_RECONNECT_DELAY_SECS, store_all_arb_enabled};
 use discovery::DiscoveryClient;
 use execution::{ExecutionEngine, create_execution_channel, run_execution_loop};
 use polymarket_clob::{PolymarketAsyncClient, PreparedCreds, SharedAsyncClient};
@@ -110,7 +110,13 @@ async fn main() -> Result<()> {
     )?;
     let api_creds = poly_async_client.derive_api_key(0).await?;
     let prepared_creds = PreparedCreds::from_api_creds(&api_creds)?;
-    let poly_async = Arc::new(SharedAsyncClient::new(poly_async_client, prepared_creds, POLYGON_CHAIN_ID));
+    // signature_type=2 for MetaMask/Browser wallet (use 1 for Magic.link/Email wallet)
+    let poly_async = Arc::new(SharedAsyncClient::with_signature_type(
+        poly_async_client,
+        prepared_creds,
+        POLYGON_CHAIN_ID,
+        2,  // Browser wallet (MetaMask, Coinbase Wallet, etc.)
+    ));
 
     info!("[POLYMARKET] Client ready for {}", &poly_funder[..10]);
 
@@ -175,6 +181,11 @@ async fn main() -> Result<()> {
         "REAL_MONEY"
     };
     info!("   Running type: {}", running_type);
+    if store_all_arb_enabled() {
+        warn!("   ⚠️  STORE_ALL_ARB=1: Storing ALL arb opportunities (for verification)");
+    } else {
+        info!("   Storage filter: Only arbs with $1+ order value per leg");
+    }
 
     let storage_channel = create_storage_channel(&db_path, running_type);
 
@@ -219,6 +230,7 @@ async fn main() -> Result<()> {
         state.clone(),
         circuit_breaker.clone(),
         position_channel,
+        storage_channel.clone(),
         dry_run,
     ));
 
@@ -265,8 +277,8 @@ async fn main() -> Result<()> {
                         let total_cost = yes_price + no_price;
                         let gap_cents = total_cost as i16 - 100;
                         let profit_per_contract = if gap_cents < 0 { (-gap_cents) as u16 } else { 0 };
-                        let yes_size: u16 = 1000;
-                        let no_size: u16 = 1000;
+                        let yes_size: u32 = 1000;
+                        let no_size: u32 = 1000;
                         let min_size = yes_size.min(no_size) as u32;
                         let max_profit_cents = (profit_per_contract as u32 * min_size) / 100;
 

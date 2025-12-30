@@ -13,6 +13,39 @@ pub struct MarketMetadataRecord {
     pub no_token_address: String,
 }
 
+/// Record for an executed trade transaction
+#[derive(Debug, Clone)]
+pub struct TradeRecord {
+    pub pair_id: String,
+    pub timestamp_secs: i64,
+    pub timestamp_ns: u32,
+
+    // Order details
+    pub yes_order_id: String,
+    pub no_order_id: String,
+
+    // Fill information
+    pub yes_filled: i64,
+    pub no_filled: i64,
+    pub matched_contracts: i64,
+
+    // Cost and profit (in cents)
+    pub yes_cost_cents: i64,
+    pub no_cost_cents: i64,
+    pub total_cost_cents: i64,
+    pub profit_cents: i64,
+
+    // Prices at execution (in cents)
+    pub yes_price: u16,
+    pub no_price: u16,
+
+    // Execution metadata
+    pub latency_us: u64,
+    pub success: bool,
+    pub error: Option<String>,
+    pub running_type: String,
+}
+
 /// Record for an arbitrage opportunity snapshot
 #[derive(Debug, Clone)]
 pub struct ArbSnapshotRecord {
@@ -22,11 +55,11 @@ pub struct ArbSnapshotRecord {
 
     // YES outcome orderbook
     pub yes_ask: u16,
-    pub yes_size: u16,
+    pub yes_size: u32,
 
     // NO outcome orderbook
     pub no_ask: u16,
-    pub no_size: u16,
+    pub no_size: u32,
 
     // Calculated values
     pub total_cost: u16,

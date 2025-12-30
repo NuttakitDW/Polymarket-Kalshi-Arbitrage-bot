@@ -1,16 +1,32 @@
-.PHONY: run test-arb dryrun db db-cli build clean
+.PHONY: run live test-arb test-storage dryrun orderbook db db-cli build clean
 
-# Run the bot normally
+# Run the bot normally (debug build)
 run:
 	cargo run
+
+# Run LIVE with real money (release build, no dry-run)
+live:
+	DRY_RUN=0 RUST_LOG=info cargo run --release
 
 # Run with synthetic arb injection for testing
 test-arb:
 	TEST_ARB=1 RUST_LOG=info cargo run
 
+# Run with STORE_ALL_ARB=1 to verify storage logic (stores all arb opportunities)
+test-storage:
+	STORE_ALL_ARB=1 RUST_LOG=info cargo run
+
+# Run with both synthetic arb and store-all for full storage verification
+test-arb-storage:
+	TEST_ARB=1 STORE_ALL_ARB=1 RUST_LOG=info cargo run
+
+# Show order book with prices and sizes
+orderbook:
+	cargo run --bin show_orderbook
+
 # Run in dry-run mode (no actual trades)
 dryrun:
-	DRY_RUN=1 RUST_LOG=info cargo run
+	DRY_RUN=1 RUST_LOG=info cargo run --release
 
 # Open database in DB Browser for SQLite (macOS)
 db:
