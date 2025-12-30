@@ -207,7 +207,7 @@ pub async fn run_ws(
     let tokens: Vec<String> = state.markets.iter()
         .take(state.market_count())
         .filter_map(|m| m.pair.as_ref())
-        .flat_map(|p| [p.poly_yes_token.to_string(), p.poly_no_token.to_string()])
+        .flat_map(|p| [p.yes_token.to_string(), p.no_token.to_string()])
         .collect();
 
     if tokens.is_empty() {
@@ -445,15 +445,15 @@ async fn process_book(
               &book.asset_id[..20.min(book.asset_id.len())],
               token_hash,
               best_ask,
-              state.poly_yes_to_id.contains_key(&token_hash),
-              state.poly_no_to_id.contains_key(&token_hash));
+              state.yes_addr_to_id.contains_key(&token_hash),
+              state.no_addr_to_id.contains_key(&token_hash));
     }
 
-    // Check if Token A (repurposed from YES token)
-    if let Some(&market_id) = state.poly_yes_to_id.get(&token_hash) {
+    // Check if YES token
+    if let Some(&market_id) = state.yes_addr_to_id.get(&token_hash) {
         let market = &state.markets[market_id as usize];
-        // Update Token A orderbook (repurposed kalshi field)
-        market.kalshi.update_yes(best_ask, ask_size);
+        // Update YES token orderbook
+        market.yes_book.update_yes(best_ask, ask_size);
 
         // Check arbs
         let arb_mask = market.check_arbs(threshold_cents);
@@ -462,11 +462,11 @@ async fn process_book(
             send_arb_request(market_id, market, arb_mask, exec_tx, clock, storage).await;
         }
     }
-    // Check if Token B (repurposed from NO token)
-    else if let Some(&market_id) = state.poly_no_to_id.get(&token_hash) {
+    // Check if NO token
+    else if let Some(&market_id) = state.no_addr_to_id.get(&token_hash) {
         let market = &state.markets[market_id as usize];
-        // Update Token B orderbook (poly field)
-        market.poly.update_yes(best_ask, ask_size);
+        // Update NO token orderbook
+        market.no_book.update_yes(best_ask, ask_size);
 
         // Check arbs
         let arb_mask = market.check_arbs(threshold_cents);
@@ -498,8 +498,8 @@ async fn process_price_change(
     static PRICE_CHANGE_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let pc_num = PRICE_CHANGE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if pc_num < 10 {
-        let found_yes = state.poly_yes_to_id.contains_key(&token_hash);
-        let found_no = state.poly_no_to_id.contains_key(&token_hash);
+        let found_yes = state.yes_addr_to_id.contains_key(&token_hash);
+        let found_no = state.no_addr_to_id.contains_key(&token_hash);
         info!("[POLY] PriceChange #{}: asset={} best_ask={} found_in_yes={} found_in_no={}",
               pc_num, &change.asset_id[..change.asset_id.len().min(30)], price_str, found_yes, found_no);
     }
@@ -510,10 +510,10 @@ async fn process_price_change(
         .and_then(|s| s.parse::<f64>().ok())
         .map(|size| (size * 100.0).round() as SizeCents);
 
-    // Check Token A (repurposed from YES token)
-    if let Some(&market_id) = state.poly_yes_to_id.get(&token_hash) {
+    // Check YES token
+    if let Some(&market_id) = state.yes_addr_to_id.get(&token_hash) {
         let market = &state.markets[market_id as usize];
-        let (current_yes, _, current_yes_size, _) = market.kalshi.load();
+        let (current_yes, _, current_yes_size, _) = market.yes_book.load();
 
         // Update price (best_ask is always the current best, so always update)
         if price != current_yes {
@@ -524,7 +524,7 @@ async fn process_price_change(
             } else {
                 current_yes_size
             };
-            market.kalshi.update_yes(price, new_size);
+            market.yes_book.update_yes(price, new_size);
 
             let arb_mask = market.check_arbs(threshold_cents);
             // Call send_arb_request if: arb detected OR store_all mode enabled
@@ -533,20 +533,20 @@ async fn process_price_change(
             }
         }
     }
-    // Check Token B (repurposed from NO token)
-    else if let Some(&market_id) = state.poly_no_to_id.get(&token_hash) {
+    // Check NO token
+    else if let Some(&market_id) = state.no_addr_to_id.get(&token_hash) {
         let market = &state.markets[market_id as usize];
-        let (current_yes, _, current_yes_size, _) = market.poly.load();
+        let (current_no, _, current_no_size, _) = market.no_book.load();
 
-        if price != current_yes {
+        if price != current_no {
             // Keep existing size from BookSnapshot. Price_change size is a single order,
             // not total liquidity. Only use event_size if we have no size yet (0).
-            let new_size = if current_yes_size == 0 {
+            let new_size = if current_no_size == 0 {
                 event_size.unwrap_or(0)
             } else {
-                current_yes_size
+                current_no_size
             };
-            market.poly.update_yes(price, new_size);
+            market.no_book.update_yes(price, new_size);
 
             let arb_mask = market.check_arbs(threshold_cents);
             // Call send_arb_request if: arb detected OR store_all mode enabled
@@ -580,8 +580,8 @@ async fn send_arb_request(
     clock: &NanoClock,
     storage: &StorageChannel,
 ) {
-    let (yes_ask, _yes_bid, yes_size, _) = market.kalshi.load();
-    let (no_ask, _no_bid, no_size, _) = market.poly.load();
+    let (yes_ask, _yes_bid, yes_size, _) = market.yes_book.load();
+    let (no_ask, _no_bid, no_size, _) = market.no_book.load();
 
     // Need both prices to record meaningful data
     if yes_ask == 0 || no_ask == 0 {

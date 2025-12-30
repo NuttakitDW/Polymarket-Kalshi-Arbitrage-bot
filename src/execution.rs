@@ -249,8 +249,8 @@ impl ExecutionEngine {
                     let poly_async = self.poly_async.clone();
                     let yes_price = req.yes_price;
                     let no_price = req.no_price;
-                    let token_a = pair.poly_yes_token.clone();
-                    let token_b = pair.poly_no_token.clone();
+                    let token_a = pair.yes_token.clone();
+                    let token_b = pair.no_token.clone();
                     let original_cost_per_contract = if yes_filled > no_filled {
                         if yes_filled > 0 { yes_cost / yes_filled } else { 0 }
                     } else {
@@ -271,14 +271,14 @@ impl ExecutionEngine {
                 }
 
                 if matched > 0 {
-                    // For Polymarket-only: both legs are on Polymarket, competing outcomes
+                    // For Polymarket-only: both legs are YES and NO tokens
                     self.position_channel.record_fill(FillRecord::new(
-                        &pair.pair_id, &pair.description, "polymarket", "token_a",
+                        &pair.pair_id, &pair.description, "yes",
                         matched as f64, yes_cost as f64 / 100.0 / yes_filled.max(1) as f64,
                         0.0, &yes_order_id,
                     ));
                     self.position_channel.record_fill(FillRecord::new(
-                        &pair.pair_id, &pair.description, "polymarket", "token_b",
+                        &pair.pair_id, &pair.description, "no",
                         matched as f64, no_cost as f64 / 100.0 / no_filled.max(1) as f64,
                         0.0, &no_order_id,
                     ));
@@ -362,67 +362,66 @@ impl ExecutionEngine {
         pair: &MarketPair,
         contracts: i64,
     ) -> Result<(i64, i64, i64, i64, String, String)> {
-        // Polymarket-only: Token A YES + Token B YES (competing outcomes)
+        // Polymarket-only: YES token + NO token
         if req.arb_type != ArbType::PolyOnly {
             return Err(anyhow!("Only PolyOnly arbitrage is supported, got {:?}", req.arb_type));
         }
 
-        let token_a_fut = self.poly_async.buy_fak(
-            &pair.poly_yes_token,
+        let yes_fut = self.poly_async.buy_fak(
+            &pair.yes_token,
             cents_to_price(req.yes_price),
             contracts as f64,
         );
-        let token_b_fut = self.poly_async.buy_fak(
-            &pair.poly_no_token,
+        let no_fut = self.poly_async.buy_fak(
+            &pair.no_token,
             cents_to_price(req.no_price),
             contracts as f64,
         );
-        let (token_a_res, token_b_res) = tokio::join!(token_a_fut, token_b_fut);
-        self.extract_poly_only_results(token_a_res, token_b_res)
+        let (yes_res, no_res) = tokio::join!(yes_fut, no_fut);
+        self.extract_poly_only_results(yes_res, no_res)
     }
 
-    /// Extract results from Poly-only execution (competing outcomes)
+    /// Extract results from Poly-only execution (YES + NO tokens)
     fn extract_poly_only_results(
         &self,
-        token_a_res: Result<crate::polymarket_clob::PolyFillAsync>,
-        token_b_res: Result<crate::polymarket_clob::PolyFillAsync>,
+        yes_res: Result<crate::polymarket_clob::PolyFillAsync>,
+        no_res: Result<crate::polymarket_clob::PolyFillAsync>,
     ) -> Result<(i64, i64, i64, i64, String, String)> {
-        let (token_a_filled, token_a_cost, token_a_order_id) = match token_a_res {
+        let (yes_filled, yes_cost, yes_order_id) = match yes_res {
             Ok(fill) => {
                 ((fill.filled_size as i64), (fill.fill_cost * 100.0) as i64, fill.order_id)
             }
             Err(e) => {
-                warn!("[EXEC] Token A failed: {}", e);
+                warn!("[EXEC] YES token failed: {}", e);
                 (0, 0, String::new())
             }
         };
 
-        let (token_b_filled, token_b_cost, token_b_order_id) = match token_b_res {
+        let (no_filled, no_cost, no_order_id) = match no_res {
             Ok(fill) => {
                 ((fill.filled_size as i64), (fill.fill_cost * 100.0) as i64, fill.order_id)
             }
             Err(e) => {
-                warn!("[EXEC] Token B failed: {}", e);
+                warn!("[EXEC] NO token failed: {}", e);
                 (0, 0, String::new())
             }
         };
 
-        // Return Token A as "yes" and Token B as "no" to keep existing result handling logic working
-        Ok((token_a_filled, token_b_filled, token_a_cost, token_b_cost, token_a_order_id, token_b_order_id))
+        Ok((yes_filled, no_filled, yes_cost, no_cost, yes_order_id, no_order_id))
     }
 
     /// Background task to automatically close excess exposure from mismatched fills (Polymarket-only)
     async fn auto_close_background_poly(
         poly_async: Arc<SharedAsyncClient>,
-        token_a_filled: i64,
-        token_b_filled: i64,
-        token_a_price: u16,
-        token_b_price: u16,
-        token_a: Arc<str>,
-        token_b: Arc<str>,
+        yes_filled: i64,
+        no_filled: i64,
+        yes_price: u16,
+        no_price: u16,
+        yes_token: Arc<str>,
+        no_token: Arc<str>,
         original_cost_per_contract: i64,
     ) {
-        let excess = (token_a_filled - token_b_filled).abs();
+        let excess = (yes_filled - no_filled).abs();
         if excess == 0 {
             return;
         }
@@ -438,10 +437,10 @@ impl ExecutionEngine {
             }
         };
 
-        let (token, token_name, price) = if token_a_filled > token_b_filled {
-            (&token_a, "Token A", token_a_price)
+        let (token, token_name, price) = if yes_filled > no_filled {
+            (&yes_token, "YES", yes_price)
         } else {
-            (&token_b, "Token B", token_b_price)
+            (&no_token, "NO", no_price)
         };
         let close_price = cents_to_price((price as i16).saturating_sub(10).max(1) as u16);
 

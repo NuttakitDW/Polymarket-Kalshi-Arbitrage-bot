@@ -53,36 +53,30 @@ impl PositionLeg {
     }
 }
 
-/// A paired position (arb position spans both platforms)
+/// A paired position (arb position for Polymarket YES/NO tokens)
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ArbPosition {
-    /// Market identifier (Kalshi ticker)
+    /// Market identifier
     pub market_id: String,
-    
+
     /// Description for logging
     pub description: String,
-    
-    /// Kalshi YES position
-    pub kalshi_yes: PositionLeg,
-    
-    /// Kalshi NO position  
-    pub kalshi_no: PositionLeg,
-    
-    /// Polymarket YES position
-    pub poly_yes: PositionLeg,
-    
-    /// Polymarket NO position
-    pub poly_no: PositionLeg,
-    
-    /// Total fees paid (Kalshi fees)
+
+    /// YES token position
+    pub yes_token: PositionLeg,
+
+    /// NO token position
+    pub no_token: PositionLeg,
+
+    /// Total fees paid
     pub total_fees: f64,
-    
+
     /// Timestamp when position was opened
     pub opened_at: String,
-    
+
     /// Status: "open", "closed", "resolved"
     pub status: String,
-    
+
     /// Realized P&L (set when position closes/resolves)
     pub realized_pnl: Option<f64>,
 }
@@ -98,53 +92,46 @@ impl ArbPosition {
             ..Default::default()
         }
     }
-    
+
     /// Total contracts across all legs
     pub fn total_contracts(&self) -> f64 {
-        self.kalshi_yes.contracts + self.kalshi_no.contracts +
-        self.poly_yes.contracts + self.poly_no.contracts
+        self.yes_token.contracts + self.no_token.contracts
     }
-    
+
     /// Total cost basis across all legs
     pub fn total_cost(&self) -> f64 {
-        self.kalshi_yes.cost_basis + self.kalshi_no.cost_basis +
-        self.poly_yes.cost_basis + self.poly_no.cost_basis +
-        self.total_fees
+        self.yes_token.cost_basis + self.no_token.cost_basis + self.total_fees
     }
-    
-    /// For a proper arb (YES on one platform + NO on other), one side always wins
+
+    /// For a proper arb (YES + NO), one side always wins
     /// This calculates the guaranteed profit assuming the arb is balanced
     pub fn guaranteed_profit(&self) -> f64 {
-        // In a balanced arb: we hold equal YES on platform A and NO on platform B
+        // In a balanced arb: we hold equal YES and NO tokens
         // Regardless of outcome, we get $1 per contract pair
         let balanced_contracts = self.matched_contracts();
         balanced_contracts - self.total_cost()
     }
-    
-    /// Number of matched contract pairs (min of YES and NO across platforms)
+
+    /// Number of matched contract pairs (min of YES and NO)
     pub fn matched_contracts(&self) -> f64 {
-        let yes_total = self.kalshi_yes.contracts + self.poly_yes.contracts;
-        let no_total = self.kalshi_no.contracts + self.poly_no.contracts;
-        yes_total.min(no_total)
+        self.yes_token.contracts.min(self.no_token.contracts)
     }
-    
+
     /// Unmatched exposure (contracts without offsetting position)
     pub fn unmatched_exposure(&self) -> f64 {
-        let yes_total = self.kalshi_yes.contracts + self.poly_yes.contracts;
-        let no_total = self.kalshi_no.contracts + self.poly_no.contracts;
-        (yes_total - no_total).abs()
+        (self.yes_token.contracts - self.no_token.contracts).abs()
     }
-    
+
     /// Mark position as resolved with outcome
     pub fn resolve(&mut self, outcome_yes_won: bool) {
         let payout = if outcome_yes_won {
-            // YES won: Kalshi YES + Poly YES pay out
-            self.kalshi_yes.contracts + self.poly_yes.contracts
+            // YES won: YES token pays out
+            self.yes_token.contracts
         } else {
-            // NO won: Kalshi NO + Poly NO pay out
-            self.kalshi_no.contracts + self.poly_no.contracts
+            // NO won: NO token pays out
+            self.no_token.contracts
         };
-        
+
         self.realized_pnl = Some(payout - self.total_cost());
         self.status = "resolved".to_string();
     }
@@ -296,18 +283,16 @@ impl PositionTracker {
             .entry(fill.market_id.clone())
             .or_insert_with(|| ArbPosition::new(&fill.market_id, &fill.description));
 
-        match (fill.platform.as_str(), fill.side.as_str()) {
-            ("kalshi", "yes") => position.kalshi_yes.add(fill.contracts, fill.price),
-            ("kalshi", "no") => position.kalshi_no.add(fill.contracts, fill.price),
-            ("polymarket", "yes") => position.poly_yes.add(fill.contracts, fill.price),
-            ("polymarket", "no") => position.poly_no.add(fill.contracts, fill.price),
-            _ => warn!("[POSITIONS] Unknown platform/side: {}/{}", fill.platform, fill.side),
+        match fill.side.as_str() {
+            "yes" => position.yes_token.add(fill.contracts, fill.price),
+            "no" => position.no_token.add(fill.contracts, fill.price),
+            _ => warn!("[POSITIONS] Unknown side: {}", fill.side),
         }
 
         position.total_fees += fill.fees;
 
-        info!("[POSITIONS] Recorded fill: {} {} {} @{:.1}¢ x{:.0} (fees: ${:.4})",
-              fill.platform, fill.side, fill.market_id,
+        info!("[POSITIONS] Recorded fill: {} {} @{:.1}¢ x{:.0} (fees: ${:.4})",
+              fill.side, fill.market_id,
               fill.price * 100.0, fill.contracts, fill.fees);
     }
     
@@ -391,7 +376,6 @@ impl PositionTracker {
 pub struct FillRecord {
     pub market_id: String,
     pub description: String,
-    pub platform: String,   // "kalshi" or "polymarket"
     pub side: String,       // "yes" or "no"
     pub contracts: f64,
     pub price: f64,
@@ -406,7 +390,6 @@ impl FillRecord {
     pub fn new(
         market_id: &str,
         description: &str,
-        platform: &str,
         side: &str,
         contracts: f64,
         price: f64,
@@ -416,7 +399,6 @@ impl FillRecord {
         Self {
             market_id: market_id.to_string(),
             description: description.to_string(),
-            platform: platform.to_string(),
             side: side.to_string(),
             contracts,
             price,
@@ -497,65 +479,65 @@ pub async fn position_writer_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_position_leg() {
         let mut leg = PositionLeg::default();
         leg.add(10.0, 0.45); // Buy 10 contracts at 45¢
-        
+
         assert_eq!(leg.contracts, 10.0);
         assert!((leg.cost_basis - 4.50).abs() < 0.001);
         assert!((leg.avg_price - 0.45).abs() < 0.001);
-        
+
         // Profit if this leg wins
         assert!((leg.profit_if_win() - 5.50).abs() < 0.001); // $10 payout - $4.50 cost
     }
-    
+
     #[test]
     fn test_arb_position_guaranteed_profit() {
         let mut pos = ArbPosition::new("TEST-MARKET", "Test");
-        
-        // Buy 10 YES on Poly at 45¢
-        pos.poly_yes.add(10.0, 0.45);
-        
-        // Buy 10 NO on Kalshi at 50¢
-        pos.kalshi_no.add(10.0, 0.50);
-        
+
+        // Buy 10 YES at 45¢
+        pos.yes_token.add(10.0, 0.45);
+
+        // Buy 10 NO at 50¢
+        pos.no_token.add(10.0, 0.50);
+
         // Total cost: $4.50 + $5.00 = $9.50
         // Guaranteed payout: $10.00 (one side wins)
         // Guaranteed profit: $0.50
-        
+
         assert!((pos.total_cost() - 9.50).abs() < 0.001);
         assert!((pos.matched_contracts() - 10.0).abs() < 0.001);
         assert!((pos.guaranteed_profit() - 0.50).abs() < 0.001);
         assert!((pos.unmatched_exposure() - 0.0).abs() < 0.001);
     }
-    
+
     #[test]
     fn test_unmatched_exposure() {
         let mut pos = ArbPosition::new("TEST-MARKET", "Test");
-        
-        // Buy 10 YES on Poly
-        pos.poly_yes.add(10.0, 0.45);
-        
-        // Buy only 8 NO on Kalshi (partial fill)
-        pos.kalshi_no.add(8.0, 0.50);
-        
+
+        // Buy 10 YES
+        pos.yes_token.add(10.0, 0.45);
+
+        // Buy only 8 NO (partial fill)
+        pos.no_token.add(8.0, 0.50);
+
         // Matched: 8, Unmatched: 2
         assert!((pos.matched_contracts() - 8.0).abs() < 0.001);
         assert!((pos.unmatched_exposure() - 2.0).abs() < 0.001);
     }
-    
+
     #[test]
     fn test_resolution() {
         let mut pos = ArbPosition::new("TEST-MARKET", "Test");
-        pos.poly_yes.add(10.0, 0.45);
-        pos.kalshi_no.add(10.0, 0.50);
-        
+        pos.yes_token.add(10.0, 0.45);
+        pos.no_token.add(10.0, 0.50);
+
         // YES wins
         pos.resolve(true);
-        
-        // Payout: 10 (poly_yes wins)
+
+        // Payout: 10 (yes_token wins)
         // Cost: 9.50
         // P&L: +0.50
         assert!((pos.realized_pnl.unwrap() - 0.50).abs() < 0.001);

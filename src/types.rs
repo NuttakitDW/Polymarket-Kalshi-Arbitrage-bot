@@ -48,16 +48,16 @@ pub struct MarketPair {
     pub market_type: MarketType,
     /// Human-readable market description
     pub description: Arc<str>,
-    /// [REPURPOSED] Polymarket Token A condition_id (was kalshi_event_ticker)
-    pub kalshi_event_ticker: Arc<str>,
-    /// [REPURPOSED] Polymarket Token A condition_id (was kalshi_market_ticker)
-    pub kalshi_market_ticker: Arc<str>,
-    /// Polymarket Token B condition_id (or market slug)
+    /// Polymarket YES token condition_id
+    pub yes_token_condition: Arc<str>,
+    /// Polymarket NO token condition_id
+    pub no_token_condition: Arc<str>,
+    /// Polymarket market slug
     pub poly_slug: Arc<str>,
-    /// Polymarket Token A address
-    pub poly_yes_token: Arc<str>,
-    /// Polymarket Token B address
-    pub poly_no_token: Arc<str>,
+    /// Polymarket YES token address
+    pub yes_token: Arc<str>,
+    /// Polymarket NO token address
+    pub no_token: Arc<str>,
     /// Line value for spread/total markets (if applicable)
     pub line_value: Option<f64>,
     /// Team suffix for team-specific markets
@@ -207,13 +207,13 @@ impl Default for AtomicOrderbook {
 /// Complete market state tracking orderbooks for competing outcomes in Polymarket-only arbitrage
 ///
 /// For Polymarket-only mode, both orderbooks represent different Polymarket tokens:
-/// - `kalshi`: Orderbook for Polymarket Token A (e.g., "Chelsea YES")
-/// - `poly`: Orderbook for Polymarket Token B (e.g., "Arsenal YES")
+/// - `yes_book`: Orderbook for YES token
+/// - `no_book`: Orderbook for NO token
 pub struct AtomicMarketState {
-    /// [REPURPOSED] Polymarket Token A orderbook state (was Kalshi platform)
-    pub kalshi: AtomicOrderbook,
-    /// Polymarket Token B orderbook state
-    pub poly: AtomicOrderbook,
+    /// YES token orderbook state
+    pub yes_book: AtomicOrderbook,
+    /// NO token orderbook state
+    pub no_book: AtomicOrderbook,
     /// Market pair metadata (immutable after discovery phase)
     pub pair: Option<Arc<MarketPair>>,
     /// Unique market identifier for O(1) lookups
@@ -223,8 +223,8 @@ pub struct AtomicMarketState {
 impl AtomicMarketState {
     pub fn new(market_id: u16) -> Self {
         Self {
-            kalshi: AtomicOrderbook::new(),
-            poly: AtomicOrderbook::new(),
+            yes_book: AtomicOrderbook::new(),
+            no_book: AtomicOrderbook::new(),
             pair: None,
             market_id,
         }
@@ -233,56 +233,28 @@ impl AtomicMarketState {
     /// Check for arbitrage opportunities.
     ///
     /// In Polymarket-only mode:
-    /// - k_yes = Token A YES price (stored in kalshi.yes_ask)
-    /// - p_yes = Token B YES price (stored in poly.yes_ask)
-    /// - k_no and p_no are NOT used (always 0)
+    /// - yes_price = YES token price
+    /// - no_price = NO token price
     ///
-    /// Returns bitmask: bit 2 = Poly-only arb (Token A YES + Token B YES < threshold)
+    /// Returns bitmask: bit 2 = Poly-only arb (YES + NO < threshold)
     #[inline(always)]
     pub fn check_arbs(&self, threshold_cents: PriceCents) -> u8 {
-        let (k_yes, _k_no, _, _) = self.kalshi.load();  // Token A YES
-        let (p_yes, _p_no, _, _) = self.poly.load();    // Token B YES
+        let (yes_price, _, _, _) = self.yes_book.load();
+        let (no_price, _, _, _) = self.no_book.load();
 
-        // For Polymarket-only mode: only check Token A YES + Token B YES
-        // (k_no and p_no are never set in this mode)
-        if k_yes == NO_PRICE || p_yes == NO_PRICE {
+        if yes_price == NO_PRICE || no_price == NO_PRICE {
             return 0;
         }
 
-        // Poly-only arbitrage: Token A YES + Token B YES (competing outcomes, NO FEES!)
-        let poly_only_cost = k_yes + p_yes;
+        // Polymarket-only arbitrage: YES + NO (competing outcomes, NO FEES!)
+        let total_cost = yes_price + no_price;
 
-        if poly_only_cost < threshold_cents {
+        if total_cost < threshold_cents {
             4  // bit 2 = Poly-only arb
         } else {
             0
         }
     }
-}
-
-/// Precomputed Kalshi trading fee lookup table (101 entries for prices 0-100 cents).
-/// Fee formula: ceil(0.07 × P × (1-P)) in cents, where P is price in cents.
-static KALSHI_FEE_TABLE: [u16; 101] = {
-    let mut table = [0u16; 101];
-    let mut p = 1u32;
-    while p < 100 {
-        // fee = ceil(7 × p × (100-p) / 10000)
-        let numerator = 7 * p * (100 - p) + 9999;
-        table[p as usize] = (numerator / 10000) as u16;
-        p += 1;
-    }
-    table
-};
-
-/// Calculate Kalshi trading fee in cents for a single contract at the given price.
-/// For typical prices (10-90 cents), fees are usually 1-2 cents per contract.
-#[inline(always)]
-#[allow(dead_code)]
-pub fn kalshi_fee_cents(price_cents: PriceCents) -> PriceCents {
-    if price_cents > 100 {
-        return 0;
-    }
-    KALSHI_FEE_TABLE[price_cents as usize]
 }
 
 /// Convert f64 price (0.01-0.99) to PriceCents (1-99)
@@ -364,7 +336,7 @@ impl FastExecutionRequest {
     }
 }
 
-/// Global market state manager for all tracked markets across both platforms
+/// Global market state manager for all tracked Polymarket markets
 pub struct GlobalState {
     /// Market states indexed by market_id for O(1) access
     pub markets: Vec<AtomicMarketState>,
@@ -372,14 +344,14 @@ pub struct GlobalState {
     /// Next available market identifier (monotonically increasing)
     next_market_id: u16,
 
-    /// O(1) lookup map: pre-hashed Kalshi ticker → market_id
-    pub kalshi_to_id: FxHashMap<u64, u16>,
+    /// O(1) lookup map: pre-hashed YES token condition → market_id
+    pub yes_token_to_id: FxHashMap<u64, u16>,
 
-    /// O(1) lookup map: pre-hashed Polymarket YES token → market_id
-    pub poly_yes_to_id: FxHashMap<u64, u16>,
+    /// O(1) lookup map: pre-hashed YES token address → market_id
+    pub yes_addr_to_id: FxHashMap<u64, u16>,
 
-    /// O(1) lookup map: pre-hashed Polymarket NO token → market_id
-    pub poly_no_to_id: FxHashMap<u64, u16>,
+    /// O(1) lookup map: pre-hashed NO token address → market_id
+    pub no_addr_to_id: FxHashMap<u64, u16>,
 }
 
 impl GlobalState {
@@ -392,9 +364,9 @@ impl GlobalState {
         Self {
             markets,
             next_market_id: 0,
-            kalshi_to_id: FxHashMap::default(),
-            poly_yes_to_id: FxHashMap::default(),
-            poly_no_to_id: FxHashMap::default(),
+            yes_token_to_id: FxHashMap::default(),
+            yes_addr_to_id: FxHashMap::default(),
+            no_addr_to_id: FxHashMap::default(),
         }
     }
 
@@ -408,14 +380,14 @@ impl GlobalState {
         self.next_market_id += 1;
 
         // Pre-compute hashes
-        let kalshi_hash = fxhash_str(&pair.kalshi_market_ticker);
-        let poly_yes_hash = fxhash_str(&pair.poly_yes_token);
-        let poly_no_hash = fxhash_str(&pair.poly_no_token);
+        let yes_condition_hash = fxhash_str(&pair.yes_token_condition);
+        let yes_addr_hash = fxhash_str(&pair.yes_token);
+        let no_addr_hash = fxhash_str(&pair.no_token);
 
         // Update lookup maps
-        self.kalshi_to_id.insert(kalshi_hash, market_id);
-        self.poly_yes_to_id.insert(poly_yes_hash, market_id);
-        self.poly_no_to_id.insert(poly_no_hash, market_id);
+        self.yes_token_to_id.insert(yes_condition_hash, market_id);
+        self.yes_addr_to_id.insert(yes_addr_hash, market_id);
+        self.no_addr_to_id.insert(no_addr_hash, market_id);
 
         // Store pair
         self.markets[market_id as usize].pair = Some(Arc::new(pair));
@@ -423,49 +395,49 @@ impl GlobalState {
         Some(market_id)
     }
 
-    /// Get market by Kalshi ticker hash (O(1))
+    /// Get market by YES token condition hash (O(1))
     #[inline(always)]
     #[allow(dead_code)]
-    pub fn get_by_kalshi_hash(&self, hash: u64) -> Option<&AtomicMarketState> {
-        let id = *self.kalshi_to_id.get(&hash)?;
+    pub fn get_by_yes_token_hash(&self, hash: u64) -> Option<&AtomicMarketState> {
+        let id = *self.yes_token_to_id.get(&hash)?;
         Some(&self.markets[id as usize])
     }
 
-    /// Get market by Poly YES token hash (O(1))
+    /// Get market by YES address hash (O(1))
     #[inline(always)]
     #[allow(dead_code)]
-    pub fn get_by_poly_yes_hash(&self, hash: u64) -> Option<&AtomicMarketState> {
-        let id = *self.poly_yes_to_id.get(&hash)?;
+    pub fn get_by_yes_addr_hash(&self, hash: u64) -> Option<&AtomicMarketState> {
+        let id = *self.yes_addr_to_id.get(&hash)?;
         Some(&self.markets[id as usize])
     }
 
-    /// Get market by Poly NO token hash (O(1))
+    /// Get market by NO address hash (O(1))
     #[inline(always)]
     #[allow(dead_code)]
-    pub fn get_by_poly_no_hash(&self, hash: u64) -> Option<&AtomicMarketState> {
-        let id = *self.poly_no_to_id.get(&hash)?;
+    pub fn get_by_no_addr_hash(&self, hash: u64) -> Option<&AtomicMarketState> {
+        let id = *self.no_addr_to_id.get(&hash)?;
         Some(&self.markets[id as usize])
     }
 
-    /// Get market_id by Poly YES token hash
+    /// Get market_id by YES address hash
     #[inline(always)]
     #[allow(dead_code)]
-    pub fn id_by_poly_yes_hash(&self, hash: u64) -> Option<u16> {
-        self.poly_yes_to_id.get(&hash).copied()
+    pub fn id_by_yes_addr_hash(&self, hash: u64) -> Option<u16> {
+        self.yes_addr_to_id.get(&hash).copied()
     }
 
-    /// Get market_id by Poly NO token hash
+    /// Get market_id by NO address hash
     #[inline(always)]
     #[allow(dead_code)]
-    pub fn id_by_poly_no_hash(&self, hash: u64) -> Option<u16> {
-        self.poly_no_to_id.get(&hash).copied()
+    pub fn id_by_no_addr_hash(&self, hash: u64) -> Option<u16> {
+        self.no_addr_to_id.get(&hash).copied()
     }
 
-    /// Get market_id by Kalshi ticker hash
+    /// Get market_id by YES token condition hash
     #[inline(always)]
     #[allow(dead_code)]
-    pub fn id_by_kalshi_hash(&self, hash: u64) -> Option<u16> {
-        self.kalshi_to_id.get(&hash).copied()
+    pub fn id_by_yes_token_hash(&self, hash: u64) -> Option<u16> {
+        self.yes_token_to_id.get(&hash).copied()
     }
 
     /// Get market by ID
@@ -503,14 +475,12 @@ pub fn fxhash_str(s: &str) -> u64 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
 pub enum Platform {
-    Kalshi,
     Polymarket,
 }
 
 impl std::fmt::Display for Platform {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Platform::Kalshi => write!(f, "KALSHI"),
             Platform::Polymarket => write!(f, "POLYMARKET"),
         }
     }
@@ -671,56 +641,6 @@ mod tests {
     }
 
     // =========================================================================
-    // kalshi_fee_cents Tests - Integer fee calculation
-    // =========================================================================
-
-    #[test]
-    fn test_kalshi_fee_cents_formula() {
-        // fee = ceil(7 × P × (100-P) / 10000) cents
-
-        // At 50 cents: ceil(7 * 50 * 50 / 10000) = ceil(1.75) = 2
-        assert_eq!(kalshi_fee_cents(50), 2);
-
-        // At 10 cents: ceil(7 * 10 * 90 / 10000) = ceil(0.63) = 1
-        assert_eq!(kalshi_fee_cents(10), 1);
-
-        // At 90 cents: ceil(7 * 90 * 10 / 10000) = ceil(0.63) = 1
-        assert_eq!(kalshi_fee_cents(90), 1);
-
-        // At 1 cent: ceil(7 * 1 * 99 / 10000) = ceil(0.0693) = 1
-        assert_eq!(kalshi_fee_cents(1), 1);
-
-        // At 99 cents: ceil(7 * 99 * 1 / 10000) = ceil(0.0693) = 1
-        assert_eq!(kalshi_fee_cents(99), 1);
-    }
-
-    #[test]
-    fn test_kalshi_fee_cents_edge_cases() {
-        // 0 and 100 should have no fee
-        assert_eq!(kalshi_fee_cents(0), 0);
-        assert_eq!(kalshi_fee_cents(100), 0);
-
-        // Values > 100 should also return 0
-        assert_eq!(kalshi_fee_cents(150), 0);
-    }
-
-    #[test]
-    fn test_kalshi_fee_cents_matches_float_formula() {
-        // Verify integer formula matches float formula for all valid prices
-        for price_cents in 1..100u16 {
-            let p = price_cents as f64 / 100.0;
-            let float_fee = (0.07 * p * (1.0 - p) * 100.0).ceil() as u16;
-            let int_fee = kalshi_fee_cents(price_cents);
-
-            // Allow 1 cent difference due to rounding differences
-            assert!(
-                (int_fee as i16 - float_fee as i16).abs() <= 1,
-                "Fee mismatch at {}¢: int={}, float={}", price_cents, int_fee, float_fee
-            );
-        }
-    }
-
-    // =========================================================================
     // Price Conversion Tests
     // =========================================================================
 
@@ -766,24 +686,21 @@ mod tests {
     // =========================================================================
 
     /// Create market state for Polymarket-only arbitrage testing.
-    /// In this mode:
-    /// - kalshi.yes = Token A price (competing outcome 1)
-    /// - poly.yes = Token B price (competing outcome 2)
+    /// - yes_book = YES token price
+    /// - no_book = NO token price
     fn make_market_state(
-        token_a_price: PriceCents,
-        token_b_price: PriceCents,
+        yes_price: PriceCents,
+        no_price: PriceCents,
     ) -> AtomicMarketState {
         let state = AtomicMarketState::new(0);
-        // Token A stored in kalshi.yes (repurposed)
-        state.kalshi.store(token_a_price, 0, 1000, 0);
-        // Token B stored in poly.yes
-        state.poly.store(token_b_price, 0, 1000, 0);
+        state.yes_book.store(yes_price, 0, 1000, 0);
+        state.no_book.store(no_price, 0, 1000, 0);
         state
     }
 
     #[test]
     fn test_check_arbs_poly_only_detected() {
-        // Token A 40¢ + Token B 48¢ = 88¢ → ARB (no fees!)
+        // YES 40¢ + NO 48¢ = 88¢ → ARB (no fees!)
         let state = make_market_state(40, 48);
 
         let mask = state.check_arbs(100);
@@ -794,7 +711,7 @@ mod tests {
 
     #[test]
     fn test_check_arbs_no_arb_efficient_market() {
-        // Token A 52¢ + Token B 52¢ = 104¢ → NO ARB (> 100¢)
+        // YES 52¢ + NO 52¢ = 104¢ → NO ARB (> 100¢)
         let state = make_market_state(52, 52);
 
         let mask = state.check_arbs(100);
@@ -803,28 +720,28 @@ mod tests {
     }
 
     #[test]
-    fn test_check_arbs_missing_token_a_price() {
-        // Missing Token A price should return no arbs
+    fn test_check_arbs_missing_yes_price() {
+        // Missing YES price should return no arbs
         let state = make_market_state(NO_PRICE, 50);
 
         let mask = state.check_arbs(100);
 
-        assert_eq!(mask, 0, "Should return 0 when Token A price is missing");
+        assert_eq!(mask, 0, "Should return 0 when YES price is missing");
     }
 
     #[test]
-    fn test_check_arbs_missing_token_b_price() {
-        // Missing Token B price should return no arbs
+    fn test_check_arbs_missing_no_price() {
+        // Missing NO price should return no arbs
         let state = make_market_state(50, NO_PRICE);
 
         let mask = state.check_arbs(100);
 
-        assert_eq!(mask, 0, "Should return 0 when Token B price is missing");
+        assert_eq!(mask, 0, "Should return 0 when NO price is missing");
     }
 
     #[test]
     fn test_check_arbs_marginal_no_arb() {
-        // Token A 50¢ + Token B 50¢ = 100¢ exactly → NO ARB (not < 100¢)
+        // YES 50¢ + NO 50¢ = 100¢ exactly → NO ARB (not < 100¢)
         let state = make_market_state(50, 50);
 
         let mask = state.check_arbs(100);
@@ -834,7 +751,7 @@ mod tests {
 
     #[test]
     fn test_check_arbs_marginal_arb() {
-        // Token A 49¢ + Token B 50¢ = 99¢ → ARB (< 100¢)
+        // YES 49¢ + NO 50¢ = 99¢ → ARB (< 100¢)
         let state = make_market_state(49, 50);
 
         let mask = state.check_arbs(100);
@@ -844,7 +761,7 @@ mod tests {
 
     #[test]
     fn test_check_arbs_large_profit() {
-        // Token A 30¢ + Token B 30¢ = 60¢ → Big ARB (40¢ profit!)
+        // YES 30¢ + NO 30¢ = 60¢ → Big ARB (40¢ profit!)
         let state = make_market_state(30, 30);
 
         let mask = state.check_arbs(100);
@@ -862,11 +779,11 @@ mod tests {
             league: "epl".into(),
             market_type: MarketType::Moneyline,
             description: format!("Test Market {}", id).into(),
-            kalshi_event_ticker: format!("KXEPLGAME-{}", id).into(),
-            kalshi_market_ticker: format!("KXEPLGAME-{}-YES", id).into(),
+            yes_token_condition: format!("condition-{}", id).into(),
+            no_token_condition: format!("condition-{}-no", id).into(),
             poly_slug: format!("test-{}", id).into(),
-            poly_yes_token: format!("yes_token_{}", id).into(),
-            poly_no_token: format!("no_token_{}", id).into(),
+            yes_token: format!("yes_token_{}", id).into(),
+            no_token: format!("no_token_{}", id).into(),
             line_value: None,
             team_suffix: None,
             category: None,
@@ -879,9 +796,9 @@ mod tests {
         let mut state = GlobalState::new();
 
         let pair = make_test_pair("001");
-        let kalshi_ticker = pair.kalshi_market_ticker.clone();
-        let poly_yes = pair.poly_yes_token.clone();
-        let poly_no = pair.poly_no_token.clone();
+        let yes_condition = pair.yes_token_condition.clone();
+        let yes_addr = pair.yes_token.clone();
+        let no_addr = pair.no_token.clone();
 
         let id = state.add_pair(pair).expect("Should add pair");
 
@@ -889,13 +806,13 @@ mod tests {
         assert_eq!(state.market_count(), 1);
 
         // Verify lookups work
-        let kalshi_hash = fxhash_str(&kalshi_ticker);
-        let poly_yes_hash = fxhash_str(&poly_yes);
-        let poly_no_hash = fxhash_str(&poly_no);
+        let yes_condition_hash = fxhash_str(&yes_condition);
+        let yes_addr_hash = fxhash_str(&yes_addr);
+        let no_addr_hash = fxhash_str(&no_addr);
 
-        assert!(state.kalshi_to_id.contains_key(&kalshi_hash));
-        assert!(state.poly_yes_to_id.contains_key(&poly_yes_hash));
-        assert!(state.poly_no_to_id.contains_key(&poly_no_hash));
+        assert!(state.yes_token_to_id.contains_key(&yes_condition_hash));
+        assert!(state.yes_addr_to_id.contains_key(&yes_addr_hash));
+        assert!(state.no_addr_to_id.contains_key(&no_addr_hash));
     }
 
     #[test]
@@ -903,8 +820,8 @@ mod tests {
         let mut state = GlobalState::new();
 
         let pair = make_test_pair("002");
-        let kalshi_ticker = pair.kalshi_market_ticker.clone();
-        let poly_yes = pair.poly_yes_token.clone();
+        let yes_condition = pair.yes_token_condition.clone();
+        let yes_addr = pair.yes_token.clone();
 
         let id = state.add_pair(pair).unwrap();
 
@@ -912,19 +829,19 @@ mod tests {
         let market = state.get_by_id(id).expect("Should find by id");
         assert!(market.pair.is_some());
 
-        // Test get_by_kalshi_hash
-        let market = state.get_by_kalshi_hash(fxhash_str(&kalshi_ticker))
-            .expect("Should find by Kalshi hash");
+        // Test get_by_yes_token_hash
+        let market = state.get_by_yes_token_hash(fxhash_str(&yes_condition))
+            .expect("Should find by YES condition hash");
         assert!(market.pair.is_some());
 
-        // Test get_by_poly_yes_hash
-        let market = state.get_by_poly_yes_hash(fxhash_str(&poly_yes))
-            .expect("Should find by Poly YES hash");
+        // Test get_by_yes_addr_hash
+        let market = state.get_by_yes_addr_hash(fxhash_str(&yes_addr))
+            .expect("Should find by YES address hash");
         assert!(market.pair.is_some());
 
         // Test id lookups
-        assert_eq!(state.id_by_kalshi_hash(fxhash_str(&kalshi_ticker)), Some(id));
-        assert_eq!(state.id_by_poly_yes_hash(fxhash_str(&poly_yes)), Some(id));
+        assert_eq!(state.id_by_yes_token_hash(fxhash_str(&yes_condition)), Some(id));
+        assert_eq!(state.id_by_yes_addr_hash(fxhash_str(&yes_addr)), Some(id));
     }
 
     #[test]
@@ -954,19 +871,19 @@ mod tests {
         let pair = make_test_pair("003");
         let id = state.add_pair(pair).unwrap();
 
-        // Update Kalshi prices
+        // Update YES token prices
         let market = state.get_by_id(id).unwrap();
-        market.kalshi.store(45, 55, 500, 600);
+        market.yes_book.store(45, 55, 500, 600);
 
-        // Update Poly prices
-        market.poly.store(44, 56, 700, 800);
+        // Update NO token prices
+        market.no_book.store(44, 56, 700, 800);
 
         // Verify prices
-        let (k_yes, k_no, k_yes_sz, k_no_sz) = market.kalshi.load();
-        assert_eq!((k_yes, k_no, k_yes_sz, k_no_sz), (45, 55, 500, 600));
+        let (yes_ask, yes_bid, yes_sz, yes_bid_sz) = market.yes_book.load();
+        assert_eq!((yes_ask, yes_bid, yes_sz, yes_bid_sz), (45, 55, 500, 600));
 
-        let (p_yes, p_no, p_yes_sz, p_no_sz) = market.poly.load();
-        assert_eq!((p_yes, p_no, p_yes_sz, p_no_sz), (44, 56, 700, 800));
+        let (no_ask, no_bid, no_sz, no_bid_sz) = market.no_book.load();
+        assert_eq!((no_ask, no_bid, no_sz, no_bid_sz), (44, 56, 700, 800));
     }
 
     // =========================================================================
@@ -1029,7 +946,7 @@ mod tests {
 
     #[test]
     fn test_fxhash_str_consistency() {
-        let s = "KXEPLGAME-25DEC27CFCARS-CFC";
+        let s = "yes_token_12345";
 
         // Same string should always produce same hash
         let h1 = fxhash_str(s);
@@ -1037,7 +954,7 @@ mod tests {
         assert_eq!(h1, h2);
 
         // Different strings should (almost certainly) produce different hashes
-        let h3 = fxhash_str("KXEPLGAME-25DEC27CFCARS-ARS");
+        let h3 = fxhash_str("no_token_12345");
         assert_ne!(h1, h3);
     }
 
@@ -1050,61 +967,59 @@ mod tests {
         // Simulate the full flow: add market, update prices, detect arb (Polymarket-only)
         let mut state = GlobalState::new();
 
-        // 1. Add market during discovery (competing outcomes in same event)
+        // 1. Add market during discovery
         let pair = MarketPair {
             pair_id: "test-arb".into(),
             league: "epl".into(),
             market_type: MarketType::Moneyline,
             description: "Chelsea vs Arsenal".into(),
-            kalshi_event_ticker: "token-a-condition".into(),
-            kalshi_market_ticker: "token-a-condition".into(),
+            yes_token_condition: "yes-condition".into(),
+            no_token_condition: "no-condition".into(),
             poly_slug: "chelsea-vs-arsenal".into(),
-            poly_yes_token: "token_a_chelsea".into(),  // Token A (Chelsea)
-            poly_no_token: "token_b_arsenal".into(),    // Token B (Arsenal)
+            yes_token: "yes_token_addr".into(),
+            no_token: "no_token_addr".into(),
             line_value: None,
             team_suffix: Some("CFC".into()),
             category: None,
             event_title: None,
         };
 
-        let poly_yes_token = pair.poly_yes_token.clone();
-        let poly_no_token = pair.poly_no_token.clone();
+        let yes_token = pair.yes_token.clone();
+        let no_token = pair.no_token.clone();
 
         let market_id = state.add_pair(pair).unwrap();
 
         // 2. Simulate WebSocket updates for both Polymarket tokens
-        // Token A (Chelsea) price update - stored in kalshi field (repurposed)
-        let poly_yes_hash = fxhash_str(&poly_yes_token);
-        if let Some(id) = state.poly_yes_to_id.get(&poly_yes_hash) {
-            // Token A YES = 40¢
-            state.markets[*id as usize].kalshi.store(40, 0, 500, 0);
+        let yes_hash = fxhash_str(&yes_token);
+        if let Some(id) = state.yes_addr_to_id.get(&yes_hash) {
+            // YES = 40¢
+            state.markets[*id as usize].yes_book.store(40, 0, 500, 0);
         }
 
-        // Token B (Arsenal) price update - stored in poly field
-        let poly_no_hash = fxhash_str(&poly_no_token);
-        if let Some(id) = state.poly_no_to_id.get(&poly_no_hash) {
-            // Token B YES = 48¢
-            state.markets[*id as usize].poly.store(48, 0, 700, 0);
+        let no_hash = fxhash_str(&no_token);
+        if let Some(id) = state.no_addr_to_id.get(&no_hash) {
+            // NO = 48¢
+            state.markets[*id as usize].no_book.store(48, 0, 700, 0);
         }
 
         // 3. Check for arbs (threshold = 100 cents = $1.00)
-        // Token A (40¢) + Token B (48¢) = 88¢ < 100¢ → ARB!
+        // YES (40¢) + NO (48¢) = 88¢ < 100¢ → ARB!
         let market = state.get_by_id(market_id).unwrap();
         let arb_mask = market.check_arbs(100);
 
         // 4. Verify arb detected (bit 2 = Poly-only arb)
-        assert!(arb_mask & 4 != 0, "Should detect Poly-only arb (Token A + Token B < 100¢)");
+        assert!(arb_mask & 4 != 0, "Should detect Poly-only arb (YES + NO < 100¢)");
 
         // 5. Build execution request
-        let (token_a_price, _, token_a_sz, _) = market.kalshi.load();
-        let (token_b_price, _, token_b_sz, _) = market.poly.load();
+        let (yes_price, _, yes_sz, _) = market.yes_book.load();
+        let (no_price, _, no_sz, _) = market.no_book.load();
 
         let req = FastExecutionRequest {
             market_id,
-            yes_price: token_a_price,
-            no_price: token_b_price,
-            yes_size: token_a_sz,
-            no_size: token_b_sz,
+            yes_price,
+            no_price,
+            yes_size: yes_sz,
+            no_size: no_sz,
             arb_type: ArbType::PolyOnly,
             detected_ns: 0,
         };
@@ -1120,8 +1035,8 @@ mod tests {
 
         // Pre-populate with a market
         let market = &state.markets[0];
-        market.kalshi.store(50, 50, 1000, 1000);
-        market.poly.store(50, 50, 1000, 1000);
+        market.yes_book.store(50, 50, 1000, 1000);
+        market.no_book.store(50, 50, 1000, 1000);
 
         let handles: Vec<_> = (0..4).map(|i| {
             let state = state.clone();
@@ -1129,11 +1044,11 @@ mod tests {
                 for j in 0..1000 {
                     let market = &state.markets[0];
                     if i % 2 == 0 {
-                        // Simulate Kalshi updates
-                        market.kalshi.update_yes(40 + ((j % 10) as u16), 500 + j as u32);
+                        // Simulate YES token updates
+                        market.yes_book.update_yes(40 + ((j % 10) as u16), 500 + j as u32);
                     } else {
-                        // Simulate Poly updates
-                        market.poly.update_no(50 + ((j % 10) as u16), 600 + j as u32);
+                        // Simulate NO token updates
+                        market.no_book.update_no(50 + ((j % 10) as u16), 600 + j as u32);
                     }
 
                     // Check arbs (should never panic) - threshold = 100 cents
@@ -1148,13 +1063,13 @@ mod tests {
 
         // Final state should be valid
         let market = &state.markets[0];
-        let (k_yes, k_no, _, _) = market.kalshi.load();
-        let (p_yes, p_no, _, _) = market.poly.load();
+        let (yes_ask, yes_bid, _, _) = market.yes_book.load();
+        let (no_ask, no_bid, _, _) = market.no_book.load();
 
-        assert!(k_yes > 0 && k_yes < 100);
-        assert!(k_no > 0 && k_no < 100);
-        assert!(p_yes > 0 && p_yes < 100);
-        assert!(p_no > 0 && p_no < 100);
+        assert!(yes_ask > 0 && yes_ask < 100);
+        assert!(yes_bid > 0 && yes_bid < 100);
+        assert!(no_ask > 0 && no_ask < 100);
+        assert!(no_bid > 0 && no_bid < 100);
     }
 }
 

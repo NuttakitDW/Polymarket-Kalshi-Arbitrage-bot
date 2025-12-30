@@ -1,6 +1,6 @@
 //! Intelligent market discovery and matching system.
 //!
-//! This module handles the discovery of matching markets between Kalshi and Polymarket,
+//! This module handles the discovery of Polymarket markets for arbitrage opportunities,
 //! with support for caching, incremental updates, and parallel processing.
 
 #![allow(dead_code, unused_variables, unused_imports)]
@@ -791,12 +791,11 @@ impl DiscoveryClient {
             league: "polymarket".into(),
             market_type: MarketType::Moneyline,
             description,
-            // Repurposed fields for Polymarket-only arbitrage:
-            kalshi_event_ticker: market.slug.clone().into(),    // Market slug
-            kalshi_market_ticker: token_a.clone().into(),       // Token A condition_id
-            poly_slug: token_b.clone().into(),                  // Token B condition_id
-            poly_yes_token: token_a.clone().into(),             // Token A address (for WebSocket lookup)
-            poly_no_token: token_b.clone().into(),              // Token B address (for WebSocket lookup)
+            yes_token_condition: token_a.clone().into(),        // YES token condition_id
+            no_token_condition: token_b.clone().into(),         // NO token condition_id
+            poly_slug: market.slug.clone().into(),              // Market slug
+            yes_token: token_a.clone().into(),                  // YES token address (for WebSocket lookup)
+            no_token: token_b.clone().into(),                   // NO token address (for WebSocket lookup)
             line_value: None,
             team_suffix: None,
             category,

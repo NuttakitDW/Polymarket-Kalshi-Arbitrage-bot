@@ -157,12 +157,12 @@ async fn main() -> Result<()> {
             info!("   ✅ {} | {}",
                   pair.description,
                   pair.market_type);
-            info!("      Token A: {} (len={})",
-                  &pair.poly_yes_token[..pair.poly_yes_token.len().min(50)],
-                  pair.poly_yes_token.len());
-            info!("      Token B: {} (len={})",
-                  &pair.poly_no_token[..pair.poly_no_token.len().min(50)],
-                  pair.poly_no_token.len());
+            info!("      YES token: {} (len={})",
+                  &pair.yes_token[..pair.yes_token.len().min(50)],
+                  pair.yes_token.len());
+            info!("      NO token: {} (len={})",
+                  &pair.no_token[..pair.no_token.len().min(50)],
+                  pair.no_token.len());
         } else if i == 5 {
             info!("   ... and {} more pairs", result.pairs.len() - 5);
         }
@@ -201,8 +201,8 @@ async fn main() -> Result<()> {
                 description: pair.description.to_string(),
                 category: pair.category.as_ref().map(|s| s.to_string()),
                 event_title: pair.event_title.as_ref().map(|s| s.to_string()),
-                yes_token_address: pair.poly_yes_token.to_string(),
-                no_token_address: pair.poly_no_token.to_string(),
+                yes_token_address: pair.yes_token.to_string(),
+                no_token_address: pair.no_token.to_string(),
             });
         }
         for pair in result.pairs {
@@ -346,17 +346,16 @@ async fn main() -> Result<()> {
             let mut best_arb: Option<(u16, u16, u16, u16)> = None;
 
             for market in heartbeat_state.markets.iter().take(market_count) {
-                let (yes_price, yes_no, _, _) = market.kalshi.load();
-                let (no_price, no_no, _, _) = market.poly.load();
-                // Polymarket binary: YES price in kalshi.yes, NO price in poly.yes
+                let (yes_price, _, _, _) = market.yes_book.load();
+                let (no_price, _, _, _) = market.no_book.load();
                 let has_yes = yes_price > 0;
                 let has_no = no_price > 0;
-                if yes_price > 0 || yes_no > 0 { with_token_a += 1; }
-                if no_price > 0 || no_no > 0 { with_token_b += 1; }
+                if has_yes { with_token_a += 1; }
+                if has_no { with_token_b += 1; }
                 if has_yes && has_no {
                     with_both += 1;
 
-                    // For Polymarket-only, we buy YES on both tokens (competing outcomes)
+                    // For Polymarket-only, we buy YES and NO tokens
                     // Cost = YES + NO (no fees on Polymarket!)
                     let cost = yes_price + no_price;
 
@@ -366,15 +365,15 @@ async fn main() -> Result<()> {
                 }
             }
 
-            info!("💓 System heartbeat | Markets: {} total, {} with Token A prices, {} with Token B prices, {} with both | threshold={}¢",
+            info!("💓 System heartbeat | Markets: {} total, {} with YES prices, {} with NO prices, {} with both | threshold={}¢",
                   market_count, with_token_a, with_token_b, with_both, heartbeat_threshold);
 
             // Debug: Log first few markets with their price status (skip first heartbeat - WebSocket not connected yet)
             if with_both == 0 && market_count > 0 && heartbeat_count > 1 {
                 info!("   🔍 Debugging first 3 markets:");
                 for (i, market) in heartbeat_state.markets.iter().take(3.min(market_count)).enumerate() {
-                    let (yes_ask, _, _, _) = market.kalshi.load();
-                    let (no_ask, _, _, _) = market.poly.load();
+                    let (yes_ask, _, _, _) = market.yes_book.load();
+                    let (no_ask, _, _, _) = market.no_book.load();
                     let desc = market.pair.as_ref()
                         .map(|p| p.description.as_ref())
                         .unwrap_or("Unknown");
@@ -399,7 +398,7 @@ async fn main() -> Result<()> {
                 }
             } else if with_both == 0 && heartbeat_count > 1 {
                 // Skip warning on first heartbeat (WebSocket not connected yet)
-                warn!("   ⚠️  No markets with both Token A and Token B prices - verify WebSocket connections");
+                warn!("   ⚠️  No markets with both YES and NO prices - verify WebSocket connections");
             }
         }
     });

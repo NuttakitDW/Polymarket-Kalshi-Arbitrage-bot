@@ -100,21 +100,19 @@ impl std::fmt::Display for TripReason {
 /// Position tracking for a single market
 #[derive(Debug, Default)]
 pub struct MarketPosition {
-    pub kalshi_yes: i64,
-    pub kalshi_no: i64,
-    pub poly_yes: i64,
-    pub poly_no: i64,
+    pub yes_token: i64,
+    pub no_token: i64,
 }
 
 #[allow(dead_code)]
 impl MarketPosition {
     pub fn net_position(&self) -> i64 {
         // Net exposure: positive = long YES, negative = long NO
-        (self.kalshi_yes + self.poly_yes) - (self.kalshi_no + self.poly_no)
+        self.yes_token - self.no_token
     }
-    
+
     pub fn total_contracts(&self) -> i64 {
-        self.kalshi_yes + self.kalshi_no + self.poly_yes + self.poly_no
+        self.yes_token + self.no_token
     }
 }
 
@@ -219,19 +217,19 @@ impl CircuitBreaker {
     }
     
     /// Record a successful execution
-    pub async fn record_success(&self, market_id: &str, kalshi_contracts: i64, poly_contracts: i64, pnl: f64) {
+    pub async fn record_success(&self, market_id: &str, yes_contracts: i64, no_contracts: i64, pnl: f64) {
         // Reset consecutive errors
         self.consecutive_errors.store(0, Ordering::SeqCst);
-        
+
         // Update P&L
         let pnl_cents = (pnl * 100.0) as i64;
         self.daily_pnl_cents.fetch_add(pnl_cents, Ordering::SeqCst);
-        
+
         // Update positions
         let mut positions = self.positions.write().await;
         let pos = positions.entry(market_id.to_string()).or_default();
-        pos.kalshi_yes += kalshi_contracts;
-        pos.poly_no += poly_contracts;
+        pos.yes_token += yes_contracts;
+        pos.no_token += no_contracts;
     }
     
     /// Record an error
