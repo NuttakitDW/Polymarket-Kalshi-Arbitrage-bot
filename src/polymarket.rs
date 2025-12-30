@@ -15,6 +15,7 @@ use tracing::{error, info, warn};
 
 use crate::config::{POLYMARKET_WS_URL, POLY_PING_INTERVAL_SECS};
 use crate::execution::NanoClock;
+use crate::storage::{ArbSnapshotRecord, StorageChannel};
 use crate::types::{
     GlobalState, FastExecutionRequest, ArbType, PriceCents, SizeCents,
     parse_price, fxhash_str,
@@ -199,6 +200,7 @@ pub async fn run_ws(
     state: Arc<GlobalState>,
     exec_tx: mpsc::Sender<FastExecutionRequest>,
     threshold_cents: PriceCents,
+    storage: StorageChannel,
 ) -> Result<()> {
     let tokens: Vec<String> = state.markets.iter()
         .take(state.market_count())
@@ -264,7 +266,7 @@ pub async fn run_ws(
                         }
 
                         // Try parsing as different message types
-                        if let Err(e) = handle_websocket_message(&text, &state, &exec_tx, threshold_cents, &clock).await {
+                        if let Err(e) = handle_websocket_message(&text, &state, &exec_tx, threshold_cents, &clock, &storage).await {
                             static ERROR_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
                             let error_count = ERROR_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             if error_count < 5 {
@@ -315,6 +317,7 @@ async fn handle_websocket_message(
     exec_tx: &mpsc::Sender<FastExecutionRequest>,
     threshold_cents: PriceCents,
     clock: &NanoClock,
+    storage: &StorageChannel,
 ) -> Result<()> {
     // Fast path: Check first character to determine message structure
     // This avoids expensive JSON parsing attempts on wrong types
@@ -329,7 +332,7 @@ async fn handle_websocket_message(
             if !books.is_empty() {
                 info!("[POLY] Received {} book snapshots", books.len());
                 for book in &books {
-                    process_book(state, book, exec_tx, threshold_cents, clock).await;
+                    process_book(state, book, exec_tx, threshold_cents, clock, storage).await;
                 }
             }
             Ok(())
@@ -354,7 +357,7 @@ async fn handle_websocket_message(
 
                         if let Some(changes) = &event.price_changes {
                             for change in changes {
-                                process_price_change(state, change, exec_tx, threshold_cents, clock).await;
+                                process_price_change(state, change, exec_tx, threshold_cents, clock, storage).await;
                             }
                         }
                         return Ok(());
@@ -379,7 +382,7 @@ async fn handle_websocket_message(
 
                 info!("[POLY] Received single book snapshot for {}",
                       &book.asset_id[..20.min(book.asset_id.len())]);
-                process_book(state, &book, exec_tx, threshold_cents, clock).await;
+                process_book(state, &book, exec_tx, threshold_cents, clock, storage).await;
                 return Ok(());
             }
 
@@ -419,6 +422,7 @@ async fn process_book(
     exec_tx: &mpsc::Sender<FastExecutionRequest>,
     threshold_cents: PriceCents,
     clock: &NanoClock,
+    storage: &StorageChannel,
 ) {
     let token_hash = fxhash_str(&book.asset_id);
 
@@ -452,7 +456,7 @@ async fn process_book(
         // Check arbs
         let arb_mask = market.check_arbs(threshold_cents);
         if arb_mask != 0 {
-            send_arb_request(market_id, market, arb_mask, exec_tx, clock).await;
+            send_arb_request(market_id, market, arb_mask, exec_tx, clock, storage).await;
         }
     }
     // Check if Token B (repurposed from NO token)
@@ -464,7 +468,7 @@ async fn process_book(
         // Check arbs
         let arb_mask = market.check_arbs(threshold_cents);
         if arb_mask != 0 {
-            send_arb_request(market_id, market, arb_mask, exec_tx, clock).await;
+            send_arb_request(market_id, market, arb_mask, exec_tx, clock, storage).await;
         }
     }
 }
@@ -477,6 +481,7 @@ async fn process_price_change(
     exec_tx: &mpsc::Sender<FastExecutionRequest>,
     threshold_cents: PriceCents,
     clock: &NanoClock,
+    storage: &StorageChannel,
 ) {
     // Use best_ask from the price_change event (this is the current best ask for the token)
     let Some(price_str) = &change.best_ask else { return };
@@ -506,7 +511,7 @@ async fn process_price_change(
 
             let arb_mask = market.check_arbs(threshold_cents);
             if arb_mask != 0 {
-                send_arb_request(market_id, market, arb_mask, exec_tx, clock).await;
+                send_arb_request(market_id, market, arb_mask, exec_tx, clock, storage).await;
             }
         }
     }
@@ -520,13 +525,26 @@ async fn process_price_change(
 
             let arb_mask = market.check_arbs(threshold_cents);
             if arb_mask != 0 {
-                send_arb_request(market_id, market, arb_mask, exec_tx, clock).await;
+                send_arb_request(market_id, market, arb_mask, exec_tx, clock, storage).await;
             }
         }
     }
 }
 
-/// Send arb request to execution engine
+/// Convert comma-separated categories to JSON array string.
+/// Input: "Politics, Business" -> Output: `["Politics","Business"]`
+fn categories_to_json(category: &Option<Arc<str>>) -> Option<String> {
+    category.as_ref().map(|cat| {
+        let parts: Vec<&str> = cat
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+        serde_json::to_string(&parts).unwrap_or_else(|_| "[]".to_string())
+    })
+}
+
+/// Send arb request to execution engine and record to storage
 #[inline]
 async fn send_arb_request(
     market_id: u16,
@@ -534,29 +552,61 @@ async fn send_arb_request(
     arb_mask: u8,
     exec_tx: &mpsc::Sender<FastExecutionRequest>,
     clock: &NanoClock,
+    storage: &StorageChannel,
 ) {
-    let (token_a_yes, _token_a_no, token_a_yes_size, _token_a_no_size) = market.kalshi.load();
-    let (token_b_yes, _token_b_no, token_b_yes_size, _token_b_no_size) = market.poly.load();
+    let (yes_ask, _yes_bid, yes_size, _) = market.kalshi.load();
+    let (no_ask, _no_bid, no_size, _) = market.poly.load();
 
     // Priority order: Polymarket-only (competing outcomes) - NO FEES!
-    let (yes_price, no_price, yes_size, no_size, arb_type) = if arb_mask & 4 != 0 {
-        // Poly only: Token A YES + Token B YES (competing outcomes)
-        (token_a_yes, token_b_yes, token_a_yes_size, token_b_yes_size, ArbType::PolyOnly)
+    let (yes_price, no_price, yes_sz, no_sz, arb_type) = if arb_mask & 4 != 0 {
+        // Poly only: YES + NO (competing outcomes)
+        (yes_ask, no_ask, yes_size, no_size, ArbType::PolyOnly)
     } else {
         // No other arb types supported in Polymarket-only mode
         return;
     };
 
+    let detected_ns = clock.now_ns();
+    let total_cost = yes_price + no_price;
+    let gap_cents = total_cost as i16 - 100;
+    let profit_per_contract = if gap_cents < 0 { (-gap_cents) as u16 } else { 0 };
+    // Max profit = profit_per_contract * min(yes_size, no_size) / 100
+    // Size is in cents, divide by 100 to get number of $1 contracts
+    let min_size = yes_sz.min(no_sz) as u32;
+    let max_profit_cents = (profit_per_contract as u32 * min_size) / 100;
+
+    // Record arb opportunity to SQLite storage
+    if let Some(pair) = &market.pair {
+        let now = chrono::Utc::now();
+        storage.record_arb(ArbSnapshotRecord {
+            pair_id: pair.pair_id.to_string(),
+            timestamp_secs: now.timestamp(),
+            timestamp_ns: (detected_ns % 1_000_000_000) as u32,
+            yes_ask: yes_price,
+            yes_size: yes_sz,
+            no_ask: no_price,
+            no_size: no_sz,
+            total_cost,
+            gap_cents,
+            profit_per_contract,
+            max_profit_cents,
+            description: Some(pair.description.to_string()),
+            event_title: pair.event_title.as_ref().map(|s| s.to_string()),
+            categories: categories_to_json(&pair.category),
+            running_type: storage.running_type.clone(),
+        });
+    }
+
     let req = FastExecutionRequest {
         market_id,
         yes_price,
         no_price,
-        yes_size,
-        no_size,
+        yes_size: yes_sz,
+        no_size: no_sz,
         arb_type,
-        detected_ns: clock.now_ns(),
+        detected_ns,
     };
 
-    // send! ~~ 
+    // send! ~~
     let _ = exec_tx.try_send(req);
 }

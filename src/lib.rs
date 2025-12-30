@@ -10,4 +10,5 @@ pub mod execution;
 pub mod polymarket;
 pub mod polymarket_clob;
 pub mod position_tracker;
+pub mod storage;
 pub mod types;
