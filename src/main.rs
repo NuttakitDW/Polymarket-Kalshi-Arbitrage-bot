@@ -37,6 +37,7 @@ use anyhow::{Context, Result};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
+use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 use config::{ARB_THRESHOLD, ENABLED_LEAGUES, WS_RECONNECT_DELAY_SECS};
@@ -53,12 +54,26 @@ const POLYGON_CHAIN_ID: u64 = 137;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize logging
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("arb_bot=info".parse().unwrap()),
-        )
+    // Initialize logging with both stdout and file output
+    let file_appender = tracing_appender::rolling::never(".", "info.log");
+    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+
+    let env_filter = tracing_subscriber::EnvFilter::from_default_env()
+        .add_directive("arb_bot=info".parse().unwrap());
+
+    // Stdout layer
+    let stdout_layer = fmt::layer()
+        .with_writer(std::io::stdout);
+
+    // File layer
+    let file_layer = fmt::layer()
+        .with_writer(non_blocking)
+        .with_ansi(false);
+
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(stdout_layer)
+        .with(file_layer)
         .init();
 
     info!("🚀 Polymarket-Only Arbitrage System v2.0");
