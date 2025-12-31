@@ -272,16 +272,14 @@ fn insert_arb_snapshot(
     };
 
     let result = conn.execute(
-        "INSERT INTO arb_snapshots (market_id, timestamp, timestamp_ns, yes_ask, yes_size, no_ask, no_size, total_cost, gap_cents, profit_per_contract, max_profit_cents, description, event_title, categories, running_type)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+        "INSERT INTO arb_snapshots (market_id, timestamp, timestamp_ns, yes_ask, no_ask, total_cost, gap_cents, profit_per_contract, max_profit_cents, description, event_title, categories, running_type)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         rusqlite::params![
             market_id,
             snapshot.timestamp_secs,
             snapshot.timestamp_ns,
             snapshot.yes_ask,
-            snapshot.yes_size,
             snapshot.no_ask,
-            snapshot.no_size,
             snapshot.total_cost,
             snapshot.gap_cents,
             snapshot.profit_per_contract,

@@ -48,7 +48,8 @@ pub struct PriceLevel {
 
 #[derive(Deserialize, Debug)]
 pub struct PriceChangeEvent {
-    #[serde(default)]
+    /// Price changes array - handle different API field names
+    #[serde(default, alias = "changes")]
     pub price_changes: Option<Vec<PriceChangeItem>>,
 }
 
@@ -570,6 +571,22 @@ fn categories_to_json(category: &Option<Arc<str>>) -> Option<String> {
     })
 }
 
+// Counters for debugging arb storage issues
+static ARB_CALL_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static ARB_BOTH_PRICES_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static ARB_SHOULD_STORE_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static ARB_PAIR_SOME_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Get arb storage debug stats (call_count, both_prices, should_store, pair_some)
+pub fn get_arb_debug_stats() -> (usize, usize, usize, usize) {
+    (
+        ARB_CALL_COUNT.load(std::sync::atomic::Ordering::Relaxed),
+        ARB_BOTH_PRICES_COUNT.load(std::sync::atomic::Ordering::Relaxed),
+        ARB_SHOULD_STORE_COUNT.load(std::sync::atomic::Ordering::Relaxed),
+        ARB_PAIR_SOME_COUNT.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 /// Send arb request to execution engine and record to storage
 #[inline]
 async fn send_arb_request(
@@ -580,6 +597,8 @@ async fn send_arb_request(
     clock: &NanoClock,
     storage: &StorageChannel,
 ) {
+    ARB_CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
     let (yes_ask, _yes_bid, yes_size, _) = market.yes_book.load();
     let (no_ask, _no_bid, no_size, _) = market.no_book.load();
 
@@ -587,6 +606,8 @@ async fn send_arb_request(
     if yes_ask == 0 || no_ask == 0 {
         return;
     }
+
+    ARB_BOTH_PRICES_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     // Use current prices for storage (even if no arb detected)
     let yes_price = yes_ask;
@@ -622,16 +643,16 @@ async fn send_arb_request(
     let should_store = store_all_arb_enabled() || (is_profitable_arb && meets_threshold);
 
     if should_store {
+        ARB_SHOULD_STORE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let Some(pair) = &market.pair {
+            ARB_PAIR_SOME_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let now = chrono::Utc::now();
             storage.record_arb(ArbSnapshotRecord {
                 pair_id: pair.pair_id.to_string(),
                 timestamp_secs: now.timestamp(),
                 timestamp_ns: (detected_ns % 1_000_000_000) as u32,
                 yes_ask: yes_price,
-                yes_size: yes_sz,
                 no_ask: no_price,
-                no_size: no_sz,
                 total_cost,
                 gap_cents,
                 profit_per_contract,

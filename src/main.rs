@@ -287,9 +287,7 @@ async fn main() -> Result<()> {
                             timestamp_secs: now.timestamp(),
                             timestamp_ns: now.timestamp_subsec_nanos(),
                             yes_ask: yes_price,
-                            yes_size,
                             no_ask: no_price,
-                            no_size,
                             total_cost,
                             gap_cents,
                             profit_per_contract,
@@ -367,6 +365,13 @@ async fn main() -> Result<()> {
 
             info!("💓 System heartbeat | Markets: {} total, {} with YES prices, {} with NO prices, {} with both | threshold={}¢",
                   market_count, with_token_a, with_token_b, with_both, heartbeat_threshold);
+
+            // Debug: Show arb processing stats
+            let (arb_calls, arb_both, arb_store, arb_pair) = polymarket::get_arb_debug_stats();
+            if arb_calls > 0 || heartbeat_count > 1 {
+                info!("   📊 Arb stats: calls={}, both_prices={}, should_store={}, pair_some={}",
+                      arb_calls, arb_both, arb_store, arb_pair);
+            }
 
             // Debug: Log first few markets with their price status (skip first heartbeat - WebSocket not connected yet)
             if with_both == 0 && market_count > 0 && heartbeat_count > 1 {

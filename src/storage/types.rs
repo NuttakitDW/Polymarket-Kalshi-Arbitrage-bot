@@ -55,11 +55,9 @@ pub struct ArbSnapshotRecord {
 
     // YES outcome orderbook
     pub yes_ask: u16,
-    pub yes_size: u32,
 
     // NO outcome orderbook
     pub no_ask: u16,
-    pub no_size: u32,
 
     // Calculated values
     pub total_cost: u16,
