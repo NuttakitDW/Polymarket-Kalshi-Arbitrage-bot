@@ -599,11 +599,12 @@ impl SharedAsyncClient {
         }
     }
 
-    /// Execute FAK buy order - 
+    /// Execute FAK buy order -
     pub async fn buy_fak(&self, token_id: &str, price: f64, size: f64) -> Result<PolyFillAsync> {
         debug_assert!(!token_id.is_empty(), "token_id must not be empty");
         debug_assert!(price > 0.0 && price < 1.0, "price must be 0 < p < 1");
         debug_assert!(size >= 1.0, "size must be >= 1");
+        tracing::debug!("[BUY_FAK] Received: price={}, size={}", price, size);
         self.execute_order(token_id, price, size, "BUY").await
     }
 
@@ -638,6 +639,9 @@ impl SharedAsyncClient {
         let signed = self.build_signed_order(token_id, price, size, side, neg_risk)?;
         // Owner must be the API key (not wallet address or funder!)
         let body = signed.post_body(&self.creds.api_key, PolyOrderType::FAK.as_str());
+
+        // Log the exact order body being sent to API
+        tracing::info!("[ORDER_BODY] Sending to Polymarket: {}", body);
 
         // Post order
         let resp = self.inner.post_order_async(body, &self.creds).await?;
@@ -680,6 +684,11 @@ impl SharedAsyncClient {
         let price_bps = price_to_bps(price);
         let size_micro = size_to_micro(size);
 
+        tracing::debug!(
+            "[BUILD_ORDER] size={}, size_micro={}, price={}, price_bps={}",
+            size, size_micro, price, price_bps
+        );
+
         if !price_valid(price_bps) {
             return Err(anyhow!("price {} ({}bps) outside allowed range", price, price_bps));
         }
@@ -691,6 +700,11 @@ impl SharedAsyncClient {
         } else {
             return Err(anyhow!("side must be BUY or SELL"));
         };
+
+        tracing::debug!(
+            "[BUILD_ORDER] maker_amt={}, taker_amt={} (size_micro was {})",
+            maker_amt, taker_amt, size_micro
+        );
 
         let salt = generate_seed();
         let maker_amount_str = maker_amt.to_string();
