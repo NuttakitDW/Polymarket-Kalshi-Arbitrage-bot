@@ -374,6 +374,14 @@ impl ExecutionEngine {
             return Err(anyhow!("Only PolyOnly arbitrage is supported, got {:?}", req.arb_type));
         }
 
+        // Validate prices are in allowed range (1-99 cents = 0.01-0.99)
+        if req.yes_price == 0 || req.yes_price >= 100 {
+            return Err(anyhow!("YES price {} cents outside allowed range (1-99)", req.yes_price));
+        }
+        if req.no_price == 0 || req.no_price >= 100 {
+            return Err(anyhow!("NO price {} cents outside allowed range (1-99)", req.no_price));
+        }
+
         let yes_fut = self.poly_async.buy_fak(
             &pair.yes_token,
             cents_to_price(req.yes_price),

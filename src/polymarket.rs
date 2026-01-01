@@ -641,8 +641,9 @@ async fn send_arb_request(
               pair_id, yes_size, no_size, if yes_size == no_size { "⚠️ SAME" } else { "✓ DIFF" });
     }
 
-    // Need both prices to record meaningful data
-    if yes_ask == 0 || no_ask == 0 {
+    // Need both prices in valid range (1-99 cents = 0.01-0.99)
+    // Prices of 0 or >= 100 are outside Polymarket's allowed trading range
+    if yes_ask == 0 || no_ask == 0 || yes_ask >= 100 || no_ask >= 100 {
         return;
     }
 
