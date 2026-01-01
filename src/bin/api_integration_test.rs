@@ -352,7 +352,12 @@ async fn find_active_market(http: &reqwest::Client) -> Result<(String, String, S
 }
 
 /// Find a market with two-sided liquidity (both bids and asks) for trading tests
-async fn find_liquid_market(http: &reqwest::Client, verbose: bool) -> Result<(String, String, String, f64, f64)> {
+/// Uses SharedAsyncClient.get_best_prices() - the canonical orderbook parsing implementation
+async fn find_liquid_market(
+    http: &reqwest::Client,
+    client: &SharedAsyncClient,
+    verbose: bool,
+) -> Result<(String, String, String, f64, f64)> {
     let url = format!("{}/events?active=true&closed=false&limit=50", GAMMA_API_HOST);
     let events: Vec<GammaEvent> = http.get(&url).send().await?.json().await?;
 
@@ -369,7 +374,8 @@ async fn find_liquid_market(http: &reqwest::Client, verbose: bool) -> Result<(St
                     if token_ids.len() >= 2 {
                         markets_checked += 1;
                         // Check if this market has liquidity on both sides
-                        match get_best_prices(http, &token_ids[0]).await {
+                        // Uses the shared get_best_prices from polymarket_clob module
+                        match client.get_best_prices(&token_ids[0]).await {
                             Ok((best_ask, best_bid)) => {
                                 // Need a market where we can at least get $0.01 back when selling
                                 if best_bid >= 0.01 && best_ask > 0.0 {
@@ -406,35 +412,6 @@ async fn find_liquid_market(http: &reqwest::Client, verbose: bool) -> Result<(St
         "No liquid markets found. Checked {} markets: {} no bids, {} no asks, {} no tokens",
         markets_checked, no_bids, no_asks, no_tokens
     ))
-}
-
-async fn get_best_prices(http: &reqwest::Client, token_id: &str) -> Result<(f64, f64)> {
-    let url = format!("{}/book?token_id={}", POLY_CLOB_HOST, token_id);
-    let book: serde_json::Value = http.get(&url).send().await?.json().await?;
-
-    // Find the LOWEST ask price (best for buyers) - orderbook may not be sorted
-    let best_ask = book.get("asks")
-        .and_then(|a| a.as_array())
-        .map(|asks| {
-            asks.iter()
-                .filter_map(|a| a.get("price")?.as_str()?.parse::<f64>().ok())
-                .fold(f64::MAX, f64::min)
-        })
-        .filter(|&p| p < f64::MAX && p > 0.0)
-        .ok_or_else(|| anyhow!("No asks in orderbook"))?;
-
-    // Find the HIGHEST bid price (best for sellers) - orderbook may not be sorted
-    let best_bid = book.get("bids")
-        .and_then(|b| b.as_array())
-        .map(|bids| {
-            bids.iter()
-                .filter_map(|b| b.get("price")?.as_str()?.parse::<f64>().ok())
-                .fold(0.0_f64, f64::max)
-        })
-        .filter(|&p| p > 0.0)
-        .ok_or_else(|| anyhow!("No bids in orderbook"))?;
-
-    Ok((best_ask, best_bid))
 }
 
 #[tokio::main]
@@ -524,7 +501,7 @@ async fn main() -> Result<()> {
 
         // Find a market with two-sided liquidity for trading tests
         println!("   Finding liquid market with bids and asks...");
-        match find_liquid_market(&http, verbose).await {
+        match find_liquid_market(&http, &tester.shared_client, verbose).await {
             Ok((trade_yes_token, _trade_no_token, trade_question, best_ask, best_bid)) => {
                 println!("   Using: {}", &trade_question[..trade_question.len().min(60)]);
                 println!("   Token: {}...{}", &trade_yes_token[..8], &trade_yes_token[trade_yes_token.len()-8..]);

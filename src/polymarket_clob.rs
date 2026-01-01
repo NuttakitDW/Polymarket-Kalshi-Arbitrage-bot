@@ -572,6 +572,43 @@ impl PolymarketAsyncClient {
     pub fn wallet(&self) -> &LocalWallet {
         &self.wallet
     }
+
+    /// Fetch orderbook and return best prices (lowest ask, highest bid)
+    /// This is the canonical implementation - use this instead of writing your own parsing!
+    pub async fn get_best_prices(&self, token_id: &str) -> Result<(f64, f64)> {
+        let url = format!("{}/book?token_id={}", self.host, token_id);
+        let book: serde_json::Value = self.http
+            .get(&url)
+            .header("User-Agent", USER_AGENT)
+            .send()
+            .await?
+            .json()
+            .await?;
+
+        // Find LOWEST ask price (best for buyers) - orderbook may NOT be sorted!
+        let best_ask = book.get("asks")
+            .and_then(|a| a.as_array())
+            .map(|asks| {
+                asks.iter()
+                    .filter_map(|a| a.get("price")?.as_str()?.parse::<f64>().ok())
+                    .fold(f64::MAX, f64::min)
+            })
+            .filter(|&p| p < f64::MAX && p > 0.0)
+            .ok_or_else(|| anyhow!("No asks in orderbook"))?;
+
+        // Find HIGHEST bid price (best for sellers) - orderbook may NOT be sorted!
+        let best_bid = book.get("bids")
+            .and_then(|b| b.as_array())
+            .map(|bids| {
+                bids.iter()
+                    .filter_map(|b| b.get("price")?.as_str()?.parse::<f64>().ok())
+                    .fold(0.0_f64, f64::max)
+            })
+            .filter(|&p| p > 0.0)
+            .ok_or_else(|| anyhow!("No bids in orderbook"))?;
+
+        Ok((best_ask, best_bid))
+    }
 }
 
 /// Shared async client wrapper for use in execution engine
@@ -608,12 +645,18 @@ impl SharedAsyncClient {
         self.execute_order(token_id, price, size, "BUY").await
     }
 
-    /// Execute FAK sell order - 
+    /// Execute FAK sell order -
     pub async fn sell_fak(&self, token_id: &str, price: f64, size: f64) -> Result<PolyFillAsync> {
         debug_assert!(!token_id.is_empty(), "token_id must not be empty");
         debug_assert!(price > 0.0 && price < 1.0, "price must be 0 < p < 1");
         debug_assert!(size >= 1.0, "size must be >= 1");
         self.execute_order(token_id, price, size, "SELL").await
+    }
+
+    /// Get best prices from orderbook (delegates to inner client)
+    /// Returns (best_ask, best_bid) - lowest ask and highest bid
+    pub async fn get_best_prices(&self, token_id: &str) -> Result<(f64, f64)> {
+        self.inner.get_best_prices(token_id).await
     }
 
     async fn execute_order(&self, token_id: &str, price: f64, size: f64, side: &str) -> Result<PolyFillAsync> {

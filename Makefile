@@ -1,4 +1,15 @@
-.PHONY: run live test-arb test-storage dryrun orderbook db db-cli build clean
+.PHONY: start run live test-arb test-storage dryrun orderbook db db-cli build clean
+
+# Start production bot with REAL MONEY (release build)
+start:
+	@echo "========================================"
+	@echo "  Polymarket Arbitrage Bot - LIVE MODE"
+	@echo "========================================"
+	@echo ""
+	@echo "DRY_RUN=0 (REAL MONEY)"
+	@echo "RUST_LOG=info"
+	@echo ""
+	DRY_RUN=0 RUST_LOG=info CB_ENABLED=true cargo run --release
 
 # Run the bot normally (debug build)
 run:
