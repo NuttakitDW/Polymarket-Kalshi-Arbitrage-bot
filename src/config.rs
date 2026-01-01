@@ -12,9 +12,9 @@ pub const GAMMA_API_BASE: &str = "https://gamma-api.polymarket.com";
 /// Arb threshold: alert when total cost < this (e.g., 0.995 = 0.5% profit)
 pub const ARB_THRESHOLD: f64 = 0.995;
 
-/// Maximum portfolio size in cents (e.g., 1500 = $15.00)
+/// Maximum portfolio size in cents (e.g., 10000 = $100.00)
 /// This caps the total position size per trade (YES + NO legs combined)
-pub const MAX_PORTFOLIO_CENTS: u32 = 1500;
+pub const MAX_PORTFOLIO_CENTS: u32 = 10000;
 
 /// Polymarket ping interval (seconds) - keep connection alive
 pub const POLY_PING_INTERVAL_SECS: u64 = 30;
