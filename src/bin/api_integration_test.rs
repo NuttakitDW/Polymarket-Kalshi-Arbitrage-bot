@@ -322,6 +322,37 @@ impl ApiTester {
         }
     }
 
+    // =========================================================================
+    // Test: Sell Order (Real Money - Sell tokens we bought)
+    // =========================================================================
+    async fn test_sell_order(&self, token_id: &str, price: f64, size: f64) -> TestResult {
+        let start = Instant::now();
+
+        // Sell at slightly below bid to ensure fill
+        let sell_price = (price - 0.02).max(0.01);
+
+        if self.verbose {
+            println!("       DEBUG: test_sell_order called with price={}, sell_price={}, size={}", price, sell_price, size);
+        }
+
+        match self.shared_client.sell_fak(token_id, sell_price, size).await {
+            Ok(result) => {
+                let latency = start.elapsed().as_millis();
+                TestResult::success(
+                    "Sell Order (FAK)",
+                    latency,
+                    format!("Order ID: {}, Sold: {:.2} @ ${:.2}, Proceeds: ${:.2}",
+                        &result.order_id[..result.order_id.len().min(16)],
+                        result.filled_size,
+                        sell_price,
+                        result.fill_cost
+                    )
+                )
+            }
+            Err(e) => TestResult::failure("Sell Order (FAK)", start.elapsed().as_millis(), format!("Error: {}", e)),
+        }
+    }
+
 }
 
 fn print_result(result: &TestResult) {
@@ -377,8 +408,8 @@ async fn find_liquid_market(
                         // Uses the shared get_best_prices from polymarket_clob module
                         match client.get_best_prices(&token_ids[0]).await {
                             Ok((best_ask, best_bid)) => {
-                                // Need a market where we can at least get $0.01 back when selling
-                                if best_bid >= 0.01 && best_ask > 0.0 {
+                                // Need a market with valid prices (0.01-0.99) and two-sided liquidity
+                                if best_bid >= 0.01 && best_bid <= 0.99 && best_ask >= 0.01 && best_ask <= 0.99 {
                                     return Ok((
                                         token_ids[0].clone(),
                                         token_ids[1].clone(),
@@ -532,10 +563,45 @@ async fn main() -> Result<()> {
                     // Debug: show exact value being passed
                     println!("   DEBUG: Sending buy order with size={} contracts", trade_size);
 
-                    // Test: Buy Order
-                    let result = tester.test_buy_order(&trade_yes_token, best_ask, trade_size).await;
-                    print_result(&result);
-                    results.push(result);
+                    // Test: Buy Order - call directly to get filled_size
+                    let start = Instant::now();
+                    match tester.shared_client.buy_fak(&trade_yes_token, best_ask, trade_size).await {
+                        Ok(buy_response) => {
+                            let latency = start.elapsed().as_millis();
+                            let filled_size = buy_response.filled_size;
+                            let buy_result = TestResult::success(
+                                "Buy Order (FAK)",
+                                latency,
+                                format!("Order ID: {}, Filled: {:.2} @ ${:.2}, Cost: ${:.2}",
+                                    &buy_response.order_id[..buy_response.order_id.len().min(16)],
+                                    filled_size,
+                                    best_ask,
+                                    buy_response.fill_cost
+                                )
+                            );
+                            print_result(&buy_result);
+                            results.push(buy_result);
+
+                            // Test: Sell Order (only if we actually bought something)
+                            if filled_size > 0.0 {
+                                println!();
+                                println!("   Waiting 5 seconds for Polymarket settlement...");
+                                tokio::time::sleep(Duration::from_secs(5)).await;
+
+                                println!("   Attempting to sell {:.2} tokens we just bought...", filled_size);
+                                let sell_result = tester.test_sell_order(&trade_yes_token, best_bid, filled_size).await;
+                                print_result(&sell_result);
+                                results.push(sell_result);
+                            } else {
+                                println!("   \x1b[33m[SKIP]\x1b[0m Sell test skipped - buy order filled 0 tokens");
+                            }
+                        }
+                        Err(e) => {
+                            let buy_result = TestResult::failure("Buy Order (FAK)", start.elapsed().as_millis(), format!("Error: {}", e));
+                            print_result(&buy_result);
+                            results.push(buy_result);
+                        }
+                    }
                 } else {
                     println!("   Trading tests skipped by user");
                 }
