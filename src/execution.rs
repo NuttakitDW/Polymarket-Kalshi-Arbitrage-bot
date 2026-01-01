@@ -267,7 +267,7 @@ impl ExecutionEngine {
                 }
 
                 if success {
-                    self.circuit_breaker.record_success(&pair.pair_id, matched, matched, actual_profit as f64 / 100.0).await;
+                    self.circuit_breaker.record_success(&pair.pair_id, matched).await;
                 }
 
                 if matched > 0 {

@@ -140,9 +140,7 @@ mod circuit_breaker_tests {
     
     fn test_config() -> CircuitBreakerConfig {
         CircuitBreakerConfig {
-            max_position_per_market: 50,
             max_total_position: 200,
-            max_daily_loss: 25.0,
             max_consecutive_errors: 3,
             cooldown_secs: 60,
             enabled: true,
@@ -153,48 +151,31 @@ mod circuit_breaker_tests {
     #[tokio::test]
     async fn test_allows_trades_within_limits() {
         let cb = CircuitBreaker::new(test_config());
-        
+
         // First trade should be allowed
         let result = cb.can_execute("market1", 10).await;
         assert!(result.is_ok(), "Should allow first trade");
-        
-        // Record success
-        cb.record_success("market1", 10, 10, 0.50).await;
-        
+
+        // Record success (10 matched = 20 total position for YES+NO)
+        cb.record_success("market1", 10).await;
+
         // Second trade on same market should still be allowed
         let result = cb.can_execute("market1", 10).await;
         assert!(result.is_ok(), "Should allow second trade within limit");
     }
-    
-    /// Test: Blocks trade exceeding per-market limit
-    #[tokio::test]
-    async fn test_blocks_per_market_limit() {
-        let cb = CircuitBreaker::new(test_config());
-        
-        // Fill up the market
-        cb.record_success("market1", 45, 45, 1.0).await;
-        
-        // Try to add 10 more (would exceed 50 limit)
-        let result = cb.can_execute("market1", 10).await;
-        
-        assert!(matches!(result, Err(TripReason::MaxPositionPerMarket { .. })),
-            "Should block trade exceeding per-market limit");
-    }
-    
+
     /// Test: Blocks trade exceeding total position limit
     #[tokio::test]
     async fn test_blocks_total_position_limit() {
         let cb = CircuitBreaker::new(test_config());
-        
-        // Fill up multiple markets
-        cb.record_success("market1", 50, 50, 1.0).await;
-        cb.record_success("market2", 50, 50, 1.0).await;
-        cb.record_success("market3", 50, 50, 1.0).await;
-        cb.record_success("market4", 45, 45, 1.0).await;  // Total: 195
-        
-        // Try to add 10 more (would exceed 200 total limit)
-        let result = cb.can_execute("market5", 10).await;
-        
+
+        // Fill up with trades (each matched = 2x position for YES+NO)
+        cb.record_success("market1", 50).await;  // 100 total
+        cb.record_success("market2", 50).await;  // 200 total (at limit)
+
+        // Try to add 1 more (would be 201 > 200 limit)
+        let result = cb.can_execute("market3", 1).await;
+
         assert!(matches!(result, Err(TripReason::MaxTotalPosition { .. })),
             "Should block trade exceeding total position limit");
     }
@@ -224,13 +205,13 @@ mod circuit_breaker_tests {
     #[tokio::test]
     async fn test_success_resets_errors() {
         let cb = CircuitBreaker::new(test_config());
-        
+
         // Record 2 errors
         cb.record_error().await;
         cb.record_error().await;
-        
+
         // Record success
-        cb.record_success("market1", 10, 10, 0.50).await;
+        cb.record_success("market1", 10).await;
         
         // Error count should be reset
         let status = cb.status().await;
@@ -288,42 +269,10 @@ mod circuit_breaker_tests {
 
 mod e2e_tests {
     use arb_bot::position_tracker::*;
-    use arb_bot::circuit_breaker::*;
 
     // Note: test_full_arb_lifecycle was removed because it used the deleted
     // make_market_state helper and MarketArbState::check_arbs method.
     // See arb_detection_tests::test_complete_arb_flow for the equivalent.
-
-    /// Scenario: Circuit breaker halts trading after losses
-    #[tokio::test]
-    async fn test_circuit_breaker_halts_on_losses() {
-        let config = CircuitBreakerConfig {
-            max_position_per_market: 100,
-            max_total_position: 500,
-            max_daily_loss: 10.0,  // Low threshold for test
-            max_consecutive_errors: 5,
-            cooldown_secs: 60,
-            enabled: true,
-        };
-
-        let cb = CircuitBreaker::new(config);
-
-        // Simulate a series of losing trades
-        // (In reality this would come from actual fill data)
-        cb.record_success("market1", 10, 10, -3.0).await;  // -$3
-        cb.record_success("market2", 10, 10, -4.0).await;  // -$7 cumulative
-
-        // Should still be allowed
-        assert!(cb.can_execute("market3", 10).await.is_ok());
-
-        // One more loss pushes over the limit
-        cb.record_success("market3", 10, 10, -5.0).await;  // -$12 cumulative
-
-        // Now should be blocked due to max daily loss
-        let result = cb.can_execute("market4", 10).await;
-        assert!(matches!(result, Err(TripReason::MaxDailyLoss { .. })),
-            "Should halt due to max daily loss");
-    }
 
     /// Scenario: Partial fill creates exposure warning
     #[tokio::test]
@@ -746,9 +695,7 @@ mod execution_tests {
     #[tokio::test]
     async fn test_circuit_breaker_integration() {
         let config = CircuitBreakerConfig {
-            max_position_per_market: 50,
-            max_total_position: 200,
-            max_daily_loss: 25.0,
+            max_total_position: 100,
             max_consecutive_errors: 3,
             cooldown_secs: 60,
             enabled: true,
@@ -756,12 +703,12 @@ mod execution_tests {
 
         let cb = CircuitBreaker::new(config);
 
-        // Fill up market position
-        cb.record_success("market1", 45, 45, 1.0).await;
+        // Fill up total position (50 matched = 100 total, at limit)
+        cb.record_success("market1", 50).await;
 
-        // Should block when adding more
-        let result = cb.can_execute("market1", 10).await;
-        assert!(matches!(result, Err(TripReason::MaxPositionPerMarket { .. })));
+        // Should block when adding more (100 + 1 > 100)
+        let result = cb.can_execute("market2", 1).await;
+        assert!(matches!(result, Err(TripReason::MaxTotalPosition { .. })));
     }
 
     /// Test: Position tracker records fills correctly
@@ -1181,7 +1128,7 @@ mod process_mock_tests {
 
         // Record success to circuit breaker
         if matched > 0 {
-            circuit_breaker.record_success(&pair.pair_id, matched, matched, actual_profit as f64 / 100.0).await;
+            circuit_breaker.record_success(&pair.pair_id, matched).await;
         }
 
         // === UPDATE POSITION TRACKER (mirrors process logic) ===
@@ -1240,9 +1187,7 @@ mod process_mock_tests {
 
     fn test_circuit_breaker_config() -> CircuitBreakerConfig {
         CircuitBreakerConfig {
-            max_position_per_market: 100,
             max_total_position: 500,
-            max_daily_loss: 50.0,
             max_consecutive_errors: 5,
             cooldown_secs: 60,
             enabled: true,

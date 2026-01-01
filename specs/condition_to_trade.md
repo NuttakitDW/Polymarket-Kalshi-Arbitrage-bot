@@ -91,29 +91,13 @@ if max_contracts < min_contracts {
 
 Before any trade executes, the circuit breaker validates:
 
-### Per-Market Position Limit
-
-```rust
-CB_MAX_POSITION_PER_MARKET = 50000  // contracts
-```
-
-Prevents overconcentration in a single market.
-
-### Total Portfolio Limit
+### Total Position Limit
 
 ```rust
 CB_MAX_TOTAL_POSITION = 100000  // contracts
 ```
 
-Hard cap on aggregate exposure across all markets.
-
-### Daily Loss Threshold
-
-```rust
-CB_MAX_DAILY_LOSS = 500  // dollars
-```
-
-Stops trading if cumulative daily losses exceed this limit.
+Hard cap on aggregate exposure across all markets. This limits capital tied up in unresolved positions.
 
 ### Consecutive Error Limit
 
@@ -121,7 +105,9 @@ Stops trading if cumulative daily losses exceed this limit.
 CB_MAX_CONSECUTIVE_ERRORS = 5
 ```
 
-Halts trading after too many consecutive failures.
+Halts trading after too many consecutive failures, indicating something may be broken.
+
+> **Note**: Since arbitrage is risk-free on matched fills (buying both YES and NO guarantees $1.00 at resolution), traditional loss-based circuit breakers are not needed.
 
 ## Trade Execution Requirements
 
@@ -176,9 +162,7 @@ ARB_THRESHOLD=0.995
 
 # Circuit breaker settings
 CB_ENABLED=true
-CB_MAX_POSITION_PER_MARKET=50000
 CB_MAX_TOTAL_POSITION=100000
-CB_MAX_DAILY_LOSS=500
 CB_MAX_CONSECUTIVE_ERRORS=5
 CB_COOLDOWN_SECS=300
 ```
