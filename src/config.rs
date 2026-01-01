@@ -48,3 +48,18 @@ pub fn store_all_arb_enabled() -> bool {
             .unwrap_or(false)
     })
 }
+
+/// Debug order sizes (set DEBUG_SIZES=1 to enable)
+/// When enabled, logs detailed size information at each pipeline stage:
+/// - BookSnapshot receipt: raw size from WebSocket
+/// - Storage: size stored in yes_book/no_book
+/// - Execution: sizes in FastExecutionRequest
+/// Default: false
+pub fn debug_sizes_enabled() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("DEBUG_SIZES")
+            .map(|v| v == "1" || v.to_lowercase() == "true")
+            .unwrap_or(false)
+    })
+}

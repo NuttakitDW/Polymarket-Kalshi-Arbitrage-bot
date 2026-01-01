@@ -1071,6 +1071,144 @@ mod tests {
         assert!(no_ask > 0 && no_ask < 100);
         assert!(no_bid > 0 && no_bid < 100);
     }
+
+    // =========================================================================
+    // YES/NO Size Independence Tests - Verify sizes are stored separately
+    // =========================================================================
+
+    #[test]
+    fn test_yes_no_sizes_stored_independently() {
+        // This test verifies that YES and NO sizes are stored in separate orderbooks
+        // and don't interfere with each other (addressing the bug where sizes were same)
+
+        let market = AtomicMarketState::new(0);
+
+        // Store different sizes for YES and NO
+        let yes_price = 45_u16;
+        let yes_size = 1500_u32;  // $15.00 in cents
+        let no_price = 55_u16;
+        let no_size = 2500_u32;   // $25.00 in cents
+
+        // Simulate what polymarket.rs does:
+        // YES token update goes to yes_book
+        market.yes_book.update_yes(yes_price, yes_size);
+
+        // NO token update goes to no_book (using update_yes because it stores in position 0)
+        market.no_book.update_yes(no_price, no_size);
+
+        // Now load and verify - simulating what send_arb_request does
+        let (loaded_yes_price, _, loaded_yes_size, _) = market.yes_book.load();
+        let (loaded_no_price, _, loaded_no_size, _) = market.no_book.load();
+
+        // Verify prices are correct
+        assert_eq!(loaded_yes_price, yes_price, "YES price should match");
+        assert_eq!(loaded_no_price, no_price, "NO price should match");
+
+        // CRITICAL: Verify sizes are different (this is the bug check)
+        assert_eq!(loaded_yes_size, yes_size, "YES size should be 1500");
+        assert_eq!(loaded_no_size, no_size, "NO size should be 2500");
+        assert_ne!(loaded_yes_size, loaded_no_size,
+            "YES and NO sizes MUST be different! YES={} NO={}", loaded_yes_size, loaded_no_size);
+    }
+
+    #[test]
+    fn test_updating_yes_size_does_not_affect_no_size() {
+        let market = AtomicMarketState::new(0);
+
+        // Set initial state for both
+        market.yes_book.update_yes(40, 1000);
+        market.no_book.update_yes(60, 2000);
+
+        // Update YES size only
+        market.yes_book.update_yes(42, 1500);
+
+        // Verify NO size is unchanged
+        let (_, _, no_size, _) = market.no_book.load();
+        assert_eq!(no_size, 2000, "NO size should be unchanged after YES update");
+
+        let (_, _, yes_size, _) = market.yes_book.load();
+        assert_eq!(yes_size, 1500, "YES size should be updated to 1500");
+    }
+
+    #[test]
+    fn test_updating_no_size_does_not_affect_yes_size() {
+        let market = AtomicMarketState::new(0);
+
+        // Set initial state for both
+        market.yes_book.update_yes(40, 1000);
+        market.no_book.update_yes(60, 2000);
+
+        // Update NO size only
+        market.no_book.update_yes(58, 3000);
+
+        // Verify YES size is unchanged
+        let (_, _, yes_size, _) = market.yes_book.load();
+        assert_eq!(yes_size, 1000, "YES size should be unchanged after NO update");
+
+        let (_, _, no_size, _) = market.no_book.load();
+        assert_eq!(no_size, 3000, "NO size should be updated to 3000");
+    }
+
+    #[test]
+    fn test_fast_execution_request_receives_different_sizes() {
+        // Simulate the full flow from storage to FastExecutionRequest creation
+        let market = AtomicMarketState::new(0);
+
+        // Simulate BookSnapshot updates with different sizes
+        market.yes_book.update_yes(48, 800);   // YES: $8.00 available
+        market.no_book.update_yes(50, 1200);   // NO: $12.00 available
+
+        // Load sizes the way send_arb_request does
+        let (yes_price, _, yes_size, _) = market.yes_book.load();
+        let (no_price, _, no_size, _) = market.no_book.load();
+
+        // Create execution request (simplified)
+        let req = FastExecutionRequest {
+            market_id: 0,
+            yes_price,
+            no_price,
+            yes_size,
+            no_size,
+            arb_type: ArbType::PolyOnly,
+            detected_ns: 0,
+        };
+
+        // Verify the request has different sizes
+        assert_eq!(req.yes_size, 800, "Request YES size should be 800");
+        assert_eq!(req.no_size, 1200, "Request NO size should be 1200");
+        assert_ne!(req.yes_size, req.no_size,
+            "Request sizes MUST be different! YES={} NO={}", req.yes_size, req.no_size);
+
+        // Verify max_from_liquidity calculation uses minimum
+        let max_from_liquidity = (req.yes_size.min(req.no_size) / 100) as i64;
+        assert_eq!(max_from_liquidity, 8, "Should use min(800,1200)/100 = 8 contracts");
+    }
+
+    #[test]
+    fn test_size_edge_cases() {
+        let market = AtomicMarketState::new(0);
+
+        // Test with zero sizes
+        market.yes_book.update_yes(50, 0);
+        market.no_book.update_yes(50, 1000);
+
+        let (_, _, yes_size, _) = market.yes_book.load();
+        let (_, _, no_size, _) = market.no_book.load();
+
+        assert_eq!(yes_size, 0, "YES size should be 0");
+        assert_eq!(no_size, 1000, "NO size should be 1000");
+
+        // Test with very large sizes
+        market.yes_book.update_yes(50, 100_000_000);  // $1M
+        market.no_book.update_yes(50, 50_000_000);    // $500K
+
+        let (_, _, yes_size, _) = market.yes_book.load();
+        let (_, _, no_size, _) = market.no_book.load();
+
+        assert_eq!(yes_size, 100_000_000, "YES size should handle $1M");
+        assert_eq!(no_size, 50_000_000, "NO size should handle $500K");
+        assert_ne!(yes_size, no_size, "Large sizes should also be different");
+    }
 }
 
 // === Polymarket/Gamma API Types ===

@@ -13,7 +13,7 @@ use tokio::time::{interval, Instant};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{error, info, warn};
 
-use crate::config::{POLYMARKET_WS_URL, POLY_PING_INTERVAL_SECS, store_all_arb_enabled};
+use crate::config::{POLYMARKET_WS_URL, POLY_PING_INTERVAL_SECS, store_all_arb_enabled, debug_sizes_enabled};
 use crate::execution::NanoClock;
 use crate::storage::{ArbSnapshotRecord, StorageChannel};
 use crate::types::{
@@ -453,8 +453,24 @@ async fn process_book(
     // Check if YES token
     if let Some(&market_id) = state.yes_addr_to_id.get(&token_hash) {
         let market = &state.markets[market_id as usize];
+
+        // Debug: log size before storage
+        if debug_sizes_enabled() {
+            let pair_id = market.pair.as_ref().map(|p| p.pair_id.as_ref()).unwrap_or("unknown");
+            info!("[SIZE_DEBUG] BookSnapshot YES | market={} | raw_size={} cents | price={}¢",
+                  pair_id, ask_size, best_ask);
+        }
+
         // Update YES token orderbook
         market.yes_book.update_yes(best_ask, ask_size);
+
+        // Debug: verify size after storage
+        if debug_sizes_enabled() {
+            let (stored_price, _, stored_size, _) = market.yes_book.load();
+            let pair_id = market.pair.as_ref().map(|p| p.pair_id.as_ref()).unwrap_or("unknown");
+            info!("[SIZE_DEBUG] Stored YES    | market={} | stored_size={} cents | stored_price={}¢",
+                  pair_id, stored_size, stored_price);
+        }
 
         // Check arbs
         let arb_mask = market.check_arbs(threshold_cents);
@@ -466,8 +482,24 @@ async fn process_book(
     // Check if NO token
     else if let Some(&market_id) = state.no_addr_to_id.get(&token_hash) {
         let market = &state.markets[market_id as usize];
+
+        // Debug: log size before storage
+        if debug_sizes_enabled() {
+            let pair_id = market.pair.as_ref().map(|p| p.pair_id.as_ref()).unwrap_or("unknown");
+            info!("[SIZE_DEBUG] BookSnapshot NO  | market={} | raw_size={} cents | price={}¢",
+                  pair_id, ask_size, best_ask);
+        }
+
         // Update NO token orderbook
         market.no_book.update_yes(best_ask, ask_size);
+
+        // Debug: verify size after storage
+        if debug_sizes_enabled() {
+            let (stored_price, _, stored_size, _) = market.no_book.load();
+            let pair_id = market.pair.as_ref().map(|p| p.pair_id.as_ref()).unwrap_or("unknown");
+            info!("[SIZE_DEBUG] Stored NO     | market={} | stored_size={} cents | stored_price={}¢",
+                  pair_id, stored_size, stored_price);
+        }
 
         // Check arbs
         let arb_mask = market.check_arbs(threshold_cents);
@@ -601,6 +633,13 @@ async fn send_arb_request(
 
     let (yes_ask, _yes_bid, yes_size, _) = market.yes_book.load();
     let (no_ask, _no_bid, no_size, _) = market.no_book.load();
+
+    // Debug: log sizes at execution request time
+    if debug_sizes_enabled() {
+        let pair_id = market.pair.as_ref().map(|p| p.pair_id.as_ref()).unwrap_or("unknown");
+        info!("[SIZE_DEBUG] ArbRequest    | market={} | yes_size={} cents | no_size={} cents | MATCH={}",
+              pair_id, yes_size, no_size, if yes_size == no_size { "⚠️ SAME" } else { "✓ DIFF" });
+    }
 
     // Need both prices to record meaningful data
     if yes_ask == 0 || no_ask == 0 {

@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{info, warn, error};
 
-use crate::config::MAX_PORTFOLIO_CENTS;
+use crate::config::{MAX_PORTFOLIO_CENTS, debug_sizes_enabled};
 use crate::polymarket_clob::SharedAsyncClient;
 use crate::types::{
     ArbType, MarketPair,
@@ -90,6 +90,13 @@ impl ExecutionEngine {
     #[inline]
     pub async fn process(&self, req: FastExecutionRequest) -> Result<ExecutionResult> {
         let market_id = req.market_id;
+
+        // Debug: log sizes received in execution request
+        if debug_sizes_enabled() {
+            info!("[SIZE_DEBUG] Exec Received | market_id={} | yes_size={} cents | no_size={} cents | MATCH={}",
+                  market_id, req.yes_size, req.no_size,
+                  if req.yes_size == req.no_size { "⚠️ SAME" } else { "✓ DIFF" });
+        }
 
         // Deduplication check (512 markets via 8x u64 bitmask)
         if market_id < 512 {
